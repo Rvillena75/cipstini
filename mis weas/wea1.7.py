@@ -1,0 +1,539 @@
+
+import math
+import random
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional
+import os
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import folium
+from branca.element import MacroElement
+from jinja2 import Template
+
+def preparar_directorio_soluciones(dir_path: str):
+    """
+    Crea un directorio si no existe y borra todos los archivos .html que contenga.
+    """
+    os.makedirs(dir_path, exist_ok=True)
+    print(f"Limpiando directorio de soluciones: '{dir_path}'")
+    for filename in os.listdir(dir_path):
+        if filename.endswith(".html"):
+            file_path = os.path.join(dir_path, filename)
+            try:
+                os.remove(file_path)
+                print(f" - Borrado: {filename}")
+            except Exception as e:
+                print(f"Error al borrar {file_path}: {e}")
+
+# ---------- CARGA DE DATOS ----------
+def load_data():
+    """Carga todos los datos desde los archivos CSV y los pre-procesa."""
+    df_over = pd.read_csv("Datos P5/i1/overview.csv")
+    df_dem = pd.read_csv("Datos P5/i1/demands.csv")
+    df_veh = pd.read_csv("Datos P5/i1/vehicles.csv")
+    df_dist = pd.read_csv("Datos P5/i1/distances.csv")
+    df_time = pd.read_csv("Datos P5/i1/times.csv")
+    df_cost = pd.read_csv("Datos P5/costs.csv")
+
+    exp = int(df_over.loc[0, "expected_matrix_size"])
+    dsz = int(df_over.loc[0, "distances_size"])
+    tsz = int(df_over.loc[0, "times_size"])
+    if dsz != exp or tsz != exp:
+        print(f"[WARN] Tamaños esperados no calzan: expected={exp}, dist={dsz}, time={tsz}")
+
+    depot = (float(df_over.loc[0,"depot_latitude"]), float(df_over.loc[0,"depot_longitude"]))
+    start_at = pd.to_datetime(df_over.loc[0, "start_at"])
+    end_at   = pd.to_datetime(df_over.loc[0, "end_at"])
+    horizon_minutes = int((end_at - start_at).total_seconds()/60)
+
+    nodes = [(depot[0], depot[1])] + list(zip(df_dem["latitude"].astype(float), df_dem["longitude"].astype(float)))
+    N = len(nodes)
+
+    def build_matrix(df, value_col):
+        M = np.zeros((N, N), dtype=float)
+        def keyfy(lat, lon):
+            return (float(f"{lat:.6f}"), float(f"{lon:.6f}"))
+        coord_to_idx = {keyfy(lat,lon):i for i,(lat,lon) in enumerate(nodes)}
+        for _, r in df.iterrows():
+            o = keyfy(r["origin_latitude"], r["origin_longitude"])
+            d = keyfy(r["destination_latitude"], r["destination_longitude"])
+            if o in coord_to_idx and d in coord_to_idx:
+                i, j = coord_to_idx[o], coord_to_idx[d]
+                M[i, j] = float(r[value_col])
+        return M
+
+    distM = build_matrix(df_dist, "distance")
+    timeM = build_matrix(df_time, "time")
+
+    demand_size = np.zeros(N, dtype=float)
+    demand_srv_s = np.zeros(N, dtype=float)
+    tw_start_min = np.zeros(N, dtype=float)
+    tw_end_min = np.zeros(N, dtype=float)
+
+    for i, row in enumerate(df_dem.itertuples(index=False), start=1):
+        demand_size[i]  = float(row.size)
+        demand_srv_s[i] = float(row.stop_time)
+        tws = getattr(row, "tw_start", None)
+        twe = getattr(row, "tw_end", None)
+        tw_start_min[i] = 0 if pd.isna(tws) else (pd.to_datetime(tws) - start_at).total_seconds()/60
+        tw_end_min[i] = horizon_minutes if pd.isna(twe) else (pd.to_datetime(twe) - start_at).total_seconds()/60
+
+    vehicle_caps = list(df_veh["capacity"].astype(float).values)
+    K = len(vehicle_caps)
+
+    fixed_route_cost = float(df_cost.loc[0, "fixed_route_cost"])
+    cost_per_meter   = float(df_cost.loc[0, "cost_per_meter"])
+    cost_per_cap     = float(df_cost.loc[0, "cost_per_vehicle_capacity"])
+
+    return {
+        "N": N, "K": K, "nodes": nodes, "distM": distM, "timeM": timeM,
+        "demand_size": demand_size, "demand_srv_s": demand_srv_s,
+        "tw_start_min": tw_start_min, "tw_end_min": tw_end_min,
+        "vehicle_caps": vehicle_caps, "fixed_route_cost": fixed_route_cost,
+        "cost_per_meter": cost_per_meter, "cost_per_cap": cost_per_cap,
+        "horizon_minutes": horizon_minutes, "start_at": start_at,
+    }
+
+# ---------- REPRESENTACIÓN Y FACTIBILIDAD ----------
+@dataclass
+class Solution:
+    routes: List[List[int]]
+    cost: Optional[float] = None
+    est_penalty: Optional[float] = None
+
+@dataclass
+class RouteMetrics:
+    load: float = 0.0
+    time_min: float = 0.0
+    dist: float = 0.0
+    feasible: bool = True
+
+def calculate_route_metrics(route: List[int], data: dict) -> RouteMetrics:
+    """Calcula y devuelve las métricas completas de una ruta."""
+    TOLERANCE = 1e-6
+    load = sum(data["demand_size"][i] for i in route)
+    time_min = 0.0
+    for i, node_idx in enumerate(route):
+        prev = route[i-1] if i > 0 else 0
+        time_min += data["timeM"][prev, node_idx] / 60.0
+        if time_min < data["tw_start_min"][node_idx] - TOLERANCE:
+            time_min = data["tw_start_min"][node_idx]
+        if time_min > data["tw_end_min"][node_idx] + TOLERANCE:
+            return RouteMetrics(load=load, feasible=False)
+        time_min += data["demand_srv_s"][node_idx] / 60.0
+    
+    last_node = route[-1] if route else 0
+    time_min += data["timeM"][last_node, 0] / 60.0
+    
+    if time_min > data["horizon_minutes"] + TOLERANCE:
+        return RouteMetrics(load=load, feasible=False)
+        
+    return RouteMetrics(load=load, time_min=time_min, feasible=True)
+
+def route_feasible(route: List[int], cap: float, data: dict) -> bool:
+    """Chequeo de factibilidad: capacidad, ventanas de tiempo y jornada."""
+    if not route: return True
+    
+    load = sum(data["demand_size"][i] for i in route)
+    if load > cap + 1e-9:
+        return False
+        
+    return calculate_route_metrics(route, data).feasible
+
+# --- FUNCIONES AUXILIARES (Sin cambios recientes) ---
+def route_distance(route: List[int], distM: np.ndarray) -> float:
+    if not route: return 0.0
+    d = distM[0, route[0]]
+    for a, b in zip(route, route[1:]):
+        d += distM[a, b]
+    d += distM[route[-1], 0]
+    return float(d)
+
+def solution_cost(sol: Solution, data) -> float:
+    active_routes = [r for r in sol.routes if r]
+    base = len(active_routes) * data["fixed_route_cost"]
+    dist = sum(route_distance(r, data["distM"]) for r in active_routes)
+    var = dist * data["cost_per_meter"]
+    cap_cost = sum(sum(data["demand_size"][i] for i in r) * data["cost_per_cap"] for r in active_routes)
+    return base + var + cap_cost
+
+def count_self_crossings(route: List[int], nodes: List[Tuple[float,float]]) -> int:
+    def segs(rt):
+        if len(rt) < 2: return []
+        return list(zip([0] + rt, rt + [0]))
+    def ccw(A,B,C):
+        ax,ay = nodes[A]; bx,by = nodes[B]; cx,cy = nodes[C]
+        return (cy - ay)*(bx - ax) > (by - ay)*(cx - ax)
+    def intersect(s1, s2):
+        a,b = s1; c,d = s2
+        if len({a,b,c,d}) < 4: return False
+        return (ccw(a,c,d) != ccw(b,c,d)) and (ccw(a,b,c) != ccw(a,b,d))
+    
+    segments = segs(route)
+    cnt = 0
+    for i in range(len(segments)):
+        for j in range(i + 1, len(segments)):
+            if intersect(segments[i], segments[j]):
+                cnt += 1
+    return cnt
+
+def _calculate_inter_route_crossings(routes: List[List[int]], nodes: List[Tuple[float,float]], intersect_func) -> int:
+    route_segments = []
+    for r_idx, route in enumerate(routes):
+        if not route: continue
+        path = [0] + route + [0]
+        segments = [(path[i], path[i+1]) for i in range(len(path)-1)]
+        route_segments.extend([(s, r_idx) for s in segments])
+    crossings = 0
+    for i in range(len(route_segments)):
+        for j in range(i + 1, len(route_segments)):
+            (seg1, r_idx1), (seg2, r_idx2) = route_segments[i], route_segments[j]
+            if r_idx1 != r_idx2 and intersect_func(seg1, seg2, nodes):
+                crossings += 1
+    return crossings // 2
+
+def _calculate_route_compactness_penalty(route: List[int], data: dict) -> float:
+    if len(route) < 2: return 0.0
+    total_dist = route_distance(route, data["distM"])
+    max_dist_from_depot = max(data["distM"][0, i] for i in route) if route else 0
+    if max_dist_from_depot == 0: return 0.0
+    compactness_ratio = (total_dist - 2 * max_dist_from_depot) / (2 * max_dist_from_depot)
+    return 1.0 / (1.0 + max(0, compactness_ratio))
+
+def _calculate_shared_path_penalty(routes: List[List[int]], data: dict) -> float:
+    shared_segments = {}
+    for route in routes:
+        if not route: continue
+        path = [0] + route + [0]
+        route_segments_in_route = set(tuple(sorted((path[i], path[i+1]))) for i in range(len(path)-1))
+        for segment in route_segments_in_route:
+            shared_segments[segment] = shared_segments.get(segment, 0) + 1
+    
+    penalty = sum(data["distM"][u, v] for (u, v), count in shared_segments.items() if count > 1)
+    return penalty
+
+def aesthetic_penalty(sol: Solution, data, **weights) -> float:
+    routes = [r for r in sol.routes if r]
+    if not routes: return 0.0
+    
+    def ccw(A,B,C, nodes):
+        ax,ay = nodes[A]; bx,by = nodes[B]; cx,cy = nodes[C]
+        return (cy - ay)*(bx - ax) > (by - ay)*(cx - ax)
+    def intersect(s1, s2, nodes):
+        a,b = s1; c,d = s2
+        if len({a,b,c,d}) < 4: return False
+        return ccw(a,c,d, nodes) != ccw(b,c,d, nodes) and ccw(a,b,c, nodes) != ccw(a,b,d, nodes)
+
+    crosses = sum(count_self_crossings(r, data["nodes"]) for r in routes)
+    overlap = _calculate_inter_route_crossings(routes, data["nodes"], intersect)
+    dists = [route_distance(r, data["distM"]) for r in routes]
+    balance = float(np.std(dists)) if dists else 0.0
+    stops = [len(r) for r in routes]
+    stops_balance = float(np.std(stops)) if stops else 0.0
+    compactness = sum(_calculate_route_compactness_penalty(r, data) for r in routes)
+    shared_path = _calculate_shared_path_penalty(routes, data)
+
+    return (weights.get('w_cross', 1000) * crosses + 
+            weights.get('w_overlap', 2000) * overlap + 
+            weights.get('w_balance', 1.0) * balance +
+            weights.get('w_stops_balance', 50) * stops_balance + 
+            weights.get('w_compact', 150) * compactness +
+            weights.get('w_shared_path', 0.1) * shared_path)
+
+def fitness(sol: Solution, data, lam: float) -> float:
+    return solution_cost(sol, data) + lam * aesthetic_penalty(sol, data)
+
+# ---------- HEURÍSTICAS Y ALGORITMO ----------
+def nearest_neighbor_seed(data) -> Solution:
+    unserved = set(range(1, data["N"]))
+    routes = []
+    for cap in sorted(data["vehicle_caps"]):
+        if not unserved: break
+        route = []
+        curr = 0
+        while True:
+            candidates = [i for i in unserved if data["demand_size"][i] <= cap - sum(data["demand_size"][c] for c in route)]
+            if not candidates: break
+            
+            candidates.sort(key=lambda j: data["distM"][curr, j])
+            best_next = next((c for c in candidates if route_feasible(route + [c], cap, data)), None)
+            
+            if best_next is None: break
+            
+            route.append(best_next)
+            unserved.remove(best_next)
+            curr = best_next
+        if route: routes.append(route)
+    
+    if unserved: print(f"[WARN] Clientes no servidos en la solución inicial: {len(unserved)}")
+    return Solution(routes=routes)
+
+def destroy_random(sol: Solution, p: float, **kwargs) -> Tuple[Solution, List[int]]:
+    all_clients = [i for r in sol.routes for i in r]
+    if not all_clients: return sol, []
+    k = max(1, int(len(all_clients) * p))
+    removed = random.sample(all_clients, k)
+    new_routes = [[c for c in r if c not in removed] for r in sol.routes]
+    return Solution(routes=new_routes), removed
+
+def destroy_worst(sol: Solution, p: float, data: dict, **kwargs) -> Tuple[Solution, List[int]]:
+    all_clients = [i for r in sol.routes for i in r]
+    if not all_clients: return sol, []
+    
+    costs = []
+    for route in sol.routes:
+        path = [0] + route + [0]
+        for i in range(1, len(path) - 1):
+            p, c, n = path[i-1], path[i], path[i+1]
+            cost = data["distM"][p, c] + data["distM"][c, n] - data["distM"][p, n]
+            costs.append((cost, c))
+            
+    costs.sort(key=lambda x: x[0], reverse=True)
+    k = max(1, int(len(all_clients) * p))
+    removed = [client for cost, client in costs[:k]]
+    new_routes = [[c for c in r if c not in removed] for r in sol.routes]
+    return Solution(routes=new_routes), removed
+
+def q_insert_regret(sol: Solution, removed: List[int], data: dict, k: int = 3) -> Solution:
+    routes = [r[:] for r in sol.routes]
+    route_caps = sorted(data["vehicle_caps"], reverse=True)
+    
+    while removed:
+        options = []
+        for cust in removed:
+            cust_costs = []
+            for ri, r in enumerate(routes):
+                cap = route_caps[ri] if ri < len(route_caps) else 0
+                for pos in range(len(r) + 1):
+                    trial = r[:pos] + [cust] + r[pos:]
+                    if route_feasible(trial, cap, data):
+                        p = r[pos-1] if pos > 0 else 0
+                        n = r[pos] if pos < len(r) else 0
+                        delta = data["distM"][p, cust] + data["distM"][cust, n] - data["distM"][p, n]
+                        cust_costs.append({'cost': delta, 'route_idx': ri, 'pos': pos})
+            
+            if len(routes) < data["K"]:
+                cap = route_caps[len(routes)] if len(routes) < len(route_caps) else 0
+                if route_feasible([cust], cap, data):
+                    delta = data["distM"][0, cust] + data["distM"][cust, 0]
+                    cust_costs.append({'cost': delta, 'route_idx': len(routes), 'pos': 0})
+
+            if cust_costs:
+                cust_costs.sort(key=lambda x: x['cost'])
+                best = cust_costs[0]
+                regret = sum(cust_costs[i]['cost'] - best['cost'] for i in range(1, min(k, len(cust_costs))))
+                options.append({'cust': cust, 'regret': regret, 'insert': best})
+
+        if not options: break
+        
+        options.sort(key=lambda x: x['regret'], reverse=True)
+        chosen = options[0]
+        cust, insert_info = chosen['cust'], chosen['insert']
+        ri, pos = insert_info['route_idx'], insert_info['pos']
+        
+        if ri == len(routes): routes.append([])
+        routes[ri].insert(pos, cust)
+        removed.remove(cust)
+
+    return Solution(routes=routes)
+
+def improve_route_with_2opt(route: List[int], data: dict) -> List[int]:
+    if len(route) < 4: return route
+    best_route = route[:]
+    best_cost = route_distance(best_route, data["distM"])
+    improved = True
+    max_iterations = 100  # Reduced from 1000 to 100
+    iteration = 0
+    TOLERANCE = 1e-4  # Increased tolerance threshold
+    MIN_IMPROVEMENT = 0.01  # Minimum 0.01% improvement required
+    
+    while improved and iteration < max_iterations:
+        iteration += 1
+        improved = False
+        path = [0] + best_route + [0]
+        for i in range(1, len(path) - 2):
+            for j in range(i + 1, len(path) - 1):
+                A, B, C, D = path[i-1], path[i], path[j], path[j+1]
+                current_cost = data["distM"][A, B] + data["distM"][C, D]
+                new_cost = data["distM"][A, C] + data["distM"][B, D]
+                
+                # Check if improvement is significant enough (at least MIN_IMPROVEMENT%)
+                relative_improvement = (current_cost - new_cost) / current_cost
+                if relative_improvement > MIN_IMPROVEMENT and (current_cost - new_cost) > TOLERANCE:
+                    new_route = best_route[:i] + best_route[i:j][::-1] + best_route[j:]
+                    if calculate_route_metrics(new_route, data).feasible:
+                        new_total_cost = route_distance(new_route, data["distM"])
+                        if new_total_cost < best_cost - TOLERANCE:
+                            best_route = new_route
+                            best_cost = new_total_cost
+                            path = [0] + best_route + [0]
+                            improved = True
+    
+    if iteration >= max_iterations:
+        print(f"[WARN] 2-opt reached maximum iterations ({max_iterations})")
+    return best_route
+
+def improve_with_relocate(sol: Solution, data: dict) -> Tuple[Solution, bool]:
+    routes = [r[:] for r in sol.routes]
+    caps = sorted(data["vehicle_caps"], reverse=True)
+    
+    for r1_idx, r1 in enumerate(routes):
+        for node_pos, cust in enumerate(r1):
+            p1 = r1[node_pos - 1] if node_pos > 0 else 0
+            n1 = r1[node_pos + 1] if node_pos < len(r1) - 1 else 0
+            cost_removed = data["distM"][p1, n1] - data["distM"][p1, cust] - data["distM"][cust, n1]
+            
+            for r2_idx, r2 in enumerate(routes):
+                if r1_idx == r2_idx: continue
+                for pos2 in range(len(r2) + 1):
+                    p2 = r2[pos2 - 1] if pos2 > 0 else 0
+                    n2 = r2[pos2] if pos2 < len(r2) else 0
+                    cost_inserted = data["distM"][p2, cust] + data["distM"][cust, n2] - data["distM"][p2, n2]
+                    
+                    if cost_removed + cost_inserted < -1e-9:
+                        new_r1 = r1[:node_pos] + r1[node_pos+1:]
+                        new_r2 = r2[:pos2] + [cust] + r2[pos2:]
+                        cap1 = caps[r1_idx] if r1_idx < len(caps) else 0
+                        cap2 = caps[r2_idx] if r2_idx < len(caps) else 0
+                        
+                        if route_feasible(new_r1, cap1, data) and route_feasible(new_r2, cap2, data):
+                            routes[r1_idx], routes[r2_idx] = new_r1, new_r2
+                            return Solution(routes=[r for r in routes if r]), True
+    return sol, False
+
+def alns_single_run(data, lam: float, iters: int = 2000, seed: int = 0) -> Solution:
+    random.seed(seed)
+    curr = nearest_neighbor_seed(data)
+    best = Solution(routes=curr.routes[:], cost=solution_cost(curr, data), est_penalty=aesthetic_penalty(curr, data))
+    
+    T, cooling_rate = 1.0, 0.999
+    destroy_ops = {'random': {'op': destroy_random, 'score': 1, 'uses': 1}, 'worst': {'op': destroy_worst, 'score': 1, 'uses': 1}}
+    R_BEST, R_BETTER, R_ACC = 3, 2, 1
+    REACT_FACTOR = 0.9
+    
+    for it in range(iters):
+        if it % 100 == 0:  # Print progress every 100 iterations
+            print(f"Iteration {it}/{iters}: Current fitness = {fitness(curr, data, lam):.2f}")
+            
+        weights = [d['score'] / d['uses'] for d in destroy_ops.values()]
+        op_name = random.choices(list(destroy_ops.keys()), weights=weights, k=1)[0]
+        op_data = destroy_ops[op_name]
+        
+        destroyed, removed = op_data['op'](curr, p=0.15, data=data)
+        op_data['uses'] += 1
+        
+        cand = q_insert_regret(destroyed, removed, data)
+        
+        MAX_LOCAL_SEARCH_ITERATIONS = 50  # Reduced from 100 to 50
+        local_search_iter = 0
+        
+        improved = True
+        initial_cost = solution_cost(cand, data)
+        while improved and local_search_iter < MAX_LOCAL_SEARCH_ITERATIONS:
+            local_search_iter += 1
+            improved = False
+            
+            # Try relocate first
+            cand, relocated = improve_with_relocate(cand, data)
+            if relocated:
+                new_cost = solution_cost(cand, data)
+                if new_cost < initial_cost - 1e-4:  # Only accept if there's meaningful improvement
+                    improved = True
+                    initial_cost = new_cost
+                    continue
+            
+            # Then try 2-opt on each route
+            routes_before = cand.routes[:]
+            cand.routes = [improve_route_with_2opt(r, data) for r in cand.routes if r]
+            if str(cand.routes) != str(routes_before):
+                new_cost = solution_cost(cand, data)
+                if new_cost < initial_cost - 1e-4:  # Only accept if there's meaningful improvement
+                    improved = True
+                    initial_cost = new_cost
+                
+        if local_search_iter >= MAX_LOCAL_SEARCH_ITERATIONS:
+            print(f"[WARN] Local search reached maximum iterations ({MAX_LOCAL_SEARCH_ITERATIONS})")
+                
+        f_curr, f_cand, f_best = fitness(curr, data, lam), fitness(cand, data, lam), fitness(best, data, lam)
+        
+        accepted, reward = False, 0
+        if f_cand < f_best:
+            reward, best, curr, accepted = R_BEST, Solution(routes=cand.routes[:], cost=solution_cost(cand, data), est_penalty=aesthetic_penalty(cand, data)), cand, True
+        elif f_cand < f_curr:
+            reward, curr, accepted = R_BETTER, cand, True
+        elif random.random() < math.exp(-(f_cand - f_curr) / max(1e-9, T)):
+            reward, curr, accepted = R_ACC, cand, True
+        
+        op_data['score'] = (1 - REACT_FACTOR) * op_data['score'] + (REACT_FACTOR * reward if accepted else 0)
+        T *= cooling_rate
+        
+    return best
+
+# ---------- EJECUCIÓN Y VISUALIZACIÓN ----------
+def run_pareto(data, lambdas=(0.0, 0.5, 1.0, 2.0, 5.0), iters=2000, seed=0):
+    sols = []
+    for lam in lambdas:
+        s = alns_single_run(data, lam=lam, iters=iters, seed=seed+int(lam*100))
+        sols.append((lam, s.cost, s.est_penalty, s))
+        print(f"Lambda {lam}: Costo={s.cost:.2f}, Penalidad={s.est_penalty:.2f}")
+
+    sols_sorted = sorted(sols, key=lambda x: (x[1], x[2]))
+    pareto = []
+    min_penalty = float('inf')
+    for item in sols_sorted:
+        if item[2] < min_penalty:
+            pareto.append(item)
+            min_penalty = item[2]
+    return sols, pareto
+
+def folium_solution_map(sol, data, outfile="mapa.html"):
+    depot_lat, depot_lon = data["nodes"][0]
+    m = folium.Map(location=[depot_lat, depot_lon], zoom_start=12, tiles="CartoDB positron")
+    folium.Marker([depot_lat, depot_lon], icon=folium.Icon(color="black", icon="home"), tooltip="Depot").add_to(m)
+    
+    ROUTE_COLORS = ["red","blue","green","purple","orange","darkred","lightblue", "lightgreen","pink","cadetblue","darkpurple","gray","black"]
+    
+    for idx, r in enumerate(r for r in sol.routes if r):
+        color = ROUTE_COLORS[idx % len(ROUTE_COLORS)]
+        pts = [[data["nodes"][i][0], data["nodes"][i][1]] for i in [0] + r + [0]]
+        folium.PolyLine(pts, weight=3, color=color, opacity=0.8, tooltip=f"Ruta {idx+1}").add_to(m)
+        for j in r:
+            lat, lon = data["nodes"][j]
+            folium.CircleMarker([lat, lon], radius=4, fill=True, color=color, fill_opacity=1).add_to(m)
+            
+    m.save(outfile)
+    return outfile
+
+def export_pareto_maps(data, pareto, output_dir="soluciones"):
+    outputs = []
+    for lam, costo, pen, sol in pareto:
+        safe_lam = str(lam).replace('.', '_')
+        fname = f"mapa_pareto_L{safe_lam}_C{int(costo)}_P{int(pen)}.html"
+        out_path = os.path.join(output_dir, fname)
+        folium_solution_map(sol, data, outfile=out_path)
+        outputs.append(out_path)
+    return outputs
+
+# === EJEMPLO DE USO ===
+if __name__ == "__main__":
+    DIRECTORIO_SALIDA = "soluciones"
+    preparar_directorio_soluciones(DIRECTORIO_SALIDA)
+    
+    data = load_data()
+    
+    lambdas_a_probar = [0.0, 10.0, 50.0]
+    iteraciones = 2000 # Aumentar para mejores resultados
+    
+    sols, pareto = run_pareto(data, lambdas=lambdas_a_probar, iters=iteraciones, seed=42)
+    
+    files = export_pareto_maps(data, pareto, output_dir=DIRECTORIO_SALIDA)
+    
+    print("\n--- Frontera de Pareto ---")
+    for lam, costo, pen, sol in pareto:
+        print(f"Lambda={lam}: Costo={costo:.2f}, Penalidad={pen:.2f}, Rutas={len([r for r in sol.routes if r])}")
+    
+    print(f"\nMapas de la frontera generados en la carpeta '{DIRECTORIO_SALIDA}':")
+    for f in files:
+        print(f" - {f}")
