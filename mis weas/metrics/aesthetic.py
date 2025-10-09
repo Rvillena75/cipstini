@@ -17,10 +17,9 @@ from .cruces_inter import (
     count_route_cuts,
     route_cuts_norm,
 )
-from .dispersion import compute_dispersion
+from .dispersion import compute_dispersion, route_shape_penalty
 from .intrusion import compute_intrusion_km, intrusion_length_between_routes_m
 from .solapamiento_geometrico import inter_route_area_overlap_score
-from .transiciones import compute_zone_transitions
 
 try:  # pragma: no cover - optional dependency
     from line_profiler import profile as line_profile
@@ -57,21 +56,27 @@ class EstheticCache:
     __slots__ = (
         "nodes",
         "distM",
-        "cluster_map",
         "lat0",
         "lon0",
         "nodes_xy",
         "route_cache",
         "pair_cache",
         "intrusion_data",
+        "disp_weights",
+        "disp_e_cap",
     )
 
-    def __init__(self, data: Dict, cluster_map):
+    def __init__(self, data: Dict):
         self.nodes = data["nodes"]
         self.distM = data["distM"]
-        self.cluster_map = cluster_map
         self.lat0, self.lon0 = self.nodes[0]
         self.nodes_xy = [self._to_xy_point(self.nodes[i][0], self.nodes[i][1]) for i in range(len(self.nodes))]
+        disp_w = data.get("dispersion_shape_weights")
+        if disp_w is not None and len(disp_w) == 4:
+            self.disp_weights = tuple(float(w) for w in disp_w)
+        else:
+            self.disp_weights = (0.4, 0.3, 0.2, 0.1)
+        self.disp_e_cap = float(data.get("dispersion_ecc_cap", 5.0))
         self.route_cache: Dict[Tuple[int, ...], Dict[str, float]] = {}
         self.pair_cache: Dict[Tuple[Tuple[int, ...], Tuple[int, ...]], Dict[str, float]] = {}
         self.intrusion_data = {"nodes": self.nodes}
@@ -109,20 +114,6 @@ class EstheticCache:
             total += math.hypot(x2 - x1, y2 - y1)
         return float(total)
 
-    def _route_dispersion(self, route: List[int]) -> float:
-        import math
-
-        if len(route) <= 1:
-            return 0.0
-        pts = [self.nodes_xy[i] for i in route]
-        xs, ys = zip(*pts)
-        centroid = (sum(xs) / len(xs), sum(ys) / len(ys))
-        dists = [math.hypot(px - centroid[0], py - centroid[1]) for px, py in pts]
-        max_dist = max(dists)
-        if max_dist <= 1e-9:
-            return 0.0
-        return sum(dists) / len(dists) / max_dist
-
     def route_metrics(self, key: Tuple[int, ...], route: List[int]) -> Dict[str, float]:
         cached = self.route_cache.get(key)
         if cached is not None:
@@ -133,17 +124,20 @@ class EstheticCache:
             'cruces_intra': 0.0,
             'distance': 0.0,
             'stops': float(len(route)),
-            'transiciones': 0.0,
             'length_m': 0.0,
         }
         if route:
-            metrics['dispersion'] = self._route_dispersion(route)
+            metrics['dispersion'] = float(
+                route_shape_penalty(
+                    route,
+                    self.nodes_xy,
+                    weights=self.disp_weights,
+                    e_cap=self.disp_e_cap,
+                )
+            )
             metrics['cruces_intra'] = float(count_self_crossings(route, self.nodes))
             metrics['distance'] = self._route_distance(route)
             metrics['length_m'] = self._route_length_m(route)
-            metrics['transiciones'] = float(compute_zone_transitions([route], self.cluster_map))
-        else:
-            metrics['transiciones'] = 0.0
 
         self.route_cache[key] = metrics
         return metrics
@@ -194,7 +188,6 @@ class EstheticCache:
                 'cruces_intra': 0.0,
                 'cross_geom': 0.0,
                 'cuts_ratio': 0.0,
-                'transiciones': 0.0,
                 'intrusion_ratio': 0.0,
                 'distances': [],
                 'stops': [],
@@ -206,7 +199,6 @@ class EstheticCache:
 
         dispersion = sum(info['dispersion'] for info in infos) / n
         cruces_intra = sum(info['cruces_intra'] for info in infos) / n
-        transiciones = sum(info['transiciones'] for info in infos) / n
         distances = [info['distance'] for info in infos]
         stops = [info['stops'] for info in infos]
         length_total = sum(info['length_m'] for info in infos)
@@ -234,7 +226,6 @@ class EstheticCache:
             'cruces_intra': cruces_intra,
             'cross_geom': cross_geom,
             'cuts_ratio': cuts_ratio,
-            'transiciones': transiciones,
             'intrusion_ratio': intrusion_ratio,
             'distances': distances,
             'stops': stops,
@@ -347,7 +338,6 @@ def _log_metrics_from_solution(sol, data) -> Dict[str, float]:
 def aesthetic_penalty(
     sol,
     data: Dict,
-    cluster_map,
     weights: Dict,
     cache: Optional[EstheticCache] = None,
 ) -> float:
@@ -369,7 +359,6 @@ def aesthetic_penalty(
             pen_cruces_intra = comp["cruces_intra"]
             pen_cruces_inter_geom = comp["cross_geom"]
             pen_cruces_inter_alt = comp["cuts_ratio"]
-            pen_transiciones = comp["transiciones"]
             pen_intrusion_km = comp["intrusion_ratio"]
 
             distances = np.array(comp["distances"], dtype=float)
@@ -387,7 +376,6 @@ def aesthetic_penalty(
                     "cruces_inter_alt",
                     "balance_dist",
                     "balance_stops",
-                    "transiciones",
                     "intrusion",
                 ):
                     _profile_add(name, 0.0)
@@ -395,15 +383,46 @@ def aesthetic_penalty(
             setup_start = time.perf_counter() if _PROFILE_ENABLED else None
             nodes = data["nodes"]
             distM = data["distM"]
+            nodes_xy = data.get("nodes_xy")
+            if nodes_xy is None:
+                lat0, lon0 = nodes[0]
+                lat0_r = math.radians(lat0)
+                lon0_r = math.radians(lon0)
+                nodes_xy = []
+                for lat, lon in nodes:
+                    lat_r = math.radians(lat)
+                    lon_r = math.radians(lon)
+                    x = _R_EARTH * (lon_r - lon0_r) * math.cos(0.5 * (lat_r + lat0_r))
+                    y = _R_EARTH * (lat_r - lat0_r)
+                    nodes_xy.append((x, y))
+                data["nodes_xy"] = nodes_xy
+            raw_disp_w = data.get("dispersion_shape_weights")
+            if raw_disp_w is not None and len(raw_disp_w) == 4:
+                disp_weights = tuple(float(w) for w in raw_disp_w)
+            else:
+                disp_weights = (0.4, 0.3, 0.2, 0.1)
+            disp_e_cap = float(data.get("dispersion_ecc_cap", 5.0))
             if _PROFILE_ENABLED and setup_start is not None:
                 _profile_add("setup", time.perf_counter() - setup_start)
 
             if _PROFILE_ENABLED:
                 start = time.perf_counter()
-                pen_dispersion = compute_dispersion(routes, nodes)
+                pen_dispersion = compute_dispersion(
+                    routes,
+                    nodes,
+                    nodes_xy,
+                    weights=disp_weights,
+                    e_cap=disp_e_cap,
+                )
                 _profile_add("dispersion", time.perf_counter() - start)
             else:
-                pen_dispersion = compute_dispersion(routes, nodes)
+                pen_dispersion = compute_dispersion(
+                    routes,
+                    nodes,
+                    nodes_xy,
+                    weights=disp_weights,
+                    e_cap=disp_e_cap,
+                )
 
             if _PROFILE_ENABLED:
                 start = time.perf_counter()
@@ -453,13 +472,6 @@ def aesthetic_penalty(
 
             if _PROFILE_ENABLED:
                 start = time.perf_counter()
-                pen_transiciones = compute_zone_transitions(routes, cluster_map)
-                _profile_add("transiciones", time.perf_counter() - start)
-            else:
-                pen_transiciones = compute_zone_transitions(routes, cluster_map)
-
-            if _PROFILE_ENABLED:
-                start = time.perf_counter()
                 pen_intrusion_km = compute_intrusion_km(routes, data)
                 _profile_add("intrusion", time.perf_counter() - start)
             else:
@@ -473,7 +485,6 @@ def aesthetic_penalty(
             "cruces_inter_ruta": pen_cruces_inter,
             "desbalance_dist_cv": pen_balance_dist,
             "desbalance_stops_cv": pen_balance_stops,
-            "transiciones_zona": pen_transiciones,
             "intrusion": pen_intrusion_km,
         }
 
@@ -506,7 +517,7 @@ def aesthetic_penalty_fast(sol, data: Dict) -> float:
     return (1.0 * balance) + (10.0 * stops_balance) + (50.0 * compactness)
 
 
-def esthetics_breakdown_final(sol, data: Dict, weights: Dict, cluster_map, lam: float = 1.0) -> Dict[str, float]:
+def esthetics_breakdown_final(sol, data: Dict, weights: Dict, lam: float = 1.0) -> Dict[str, float]:
     routes = [r for r in sol.routes if r]
     if not routes:
         return {
@@ -515,15 +526,14 @@ def esthetics_breakdown_final(sol, data: Dict, weights: Dict, cluster_map, lam: 
             "cruces_inter_ruta": 0.0,
             "desbalance_dist_cv": 0.0,
             "desbalance_stops_cv": 0.0,
-            "transiciones_zona": 0.0,
             "intrusion": 0.0,
             "penalizacion_cruda": 0.0,
             "detalle_sin_pesos": {},
         }
 
-    cache = EstheticCache(data, cluster_map)
+    cache = EstheticCache(data)
     comp = cache.compute_components(routes)
-    pen_cruda = aesthetic_penalty(sol, data, cluster_map, weights, cache=cache)
+    pen_cruda = aesthetic_penalty(sol, data, weights, cache=cache)
 
     distances = np.array(comp["distances"], dtype=float)
     stops = np.array(comp["stops"], dtype=float)
@@ -535,7 +545,6 @@ def esthetics_breakdown_final(sol, data: Dict, weights: Dict, cluster_map, lam: 
     pen_dispersion = comp["dispersion"]
     pen_cruces_intra = comp["cruces_intra"]
     pen_cruces_inter = max(comp["cross_geom"], comp["cuts_ratio"] * 2.0) * 3.0
-    pen_transiciones = comp["transiciones"]
     pen_intrusion = comp["intrusion_ratio"]
 
     metrics = {
@@ -544,7 +553,6 @@ def esthetics_breakdown_final(sol, data: Dict, weights: Dict, cluster_map, lam: 
         "cruces_inter_ruta": pen_cruces_inter,
         "desbalance_dist_cv": pen_balance_dist,
         "desbalance_stops_cv": pen_balance_stops,
-        "transiciones_zona": pen_transiciones,
         "intrusion": pen_intrusion,
     }
 
@@ -567,7 +575,6 @@ WEIGHT_KEYS = {
     "cruces_inter_ruta": "w_cruces_inter",
     "desbalance_dist_cv": "w_balance_dist",
     "desbalance_stops_cv": "w_balance_stops",
-    "transiciones_zona": "w_transiciones",
     "intrusion": "w_intrusion",
 }
 

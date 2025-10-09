@@ -2,13 +2,10 @@ import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import numpy as np
-
 from alns_core import (
     BASE_DIR,
     export_pareto_dual_maps,
     load_data,
-    precalculate_clusters,
     preparar_directorio_soluciones,
     run_single_experiment,
     validar_solucion_final,
@@ -19,15 +16,12 @@ from metrics.aesthetic import esthetics_breakdown_final
 
 
 DEFAULT_WEIGHTS: Dict[str, float] = {
-    "w_solapamiento": 50.0,
-    "w_sector": 30.0,
     "w_intrusion": 400.0,
     "w_dispersion": 40.0,
     "w_cruces_intra": 30.0,
     "w_cruces_inter": 40.0,
     "w_balance_dist": 60.0,
     "w_balance_stops": 60.0,
-    "w_transiciones": 10.0,
 }
 
 DEFAULT_LAMBDAS: Tuple[int, ...] = (0, 250, 500, 100000)
@@ -64,14 +58,6 @@ def main(
     print("Cargando datos...")
     data = load_data()
 
-    print("Generando zonas virtuales (clusters)...")
-    n_clientes = data["N"] - 1
-    n_zonas = min(n_clientes, data["K"])
-    if n_zonas > 0:
-        cluster_map = precalculate_clusters(data, n_clusters=n_zonas)
-    else:
-        cluster_map = np.full(data["N"], -1, dtype=int)
-
     print("Parámetros de ejecución:")
     print(f"  - Lambdas: {lambdas}")
     print(f"  - Iteraciones por corrida: {iterations}")
@@ -87,7 +73,6 @@ def main(
             weights=weights,
             lambdas=list(lambdas),
             iters=iterations,
-            cluster_map=cluster_map,
         )
         all_pareto_solutions.extend(pareto)
 
@@ -110,7 +95,7 @@ def main(
     for idx, (lam, costo, pen, sol) in enumerate(final_pareto, start=1):
         nombre_sol = f"Solución {idx} (λ={lam})"
         validar_solucion_final(sol, data, nombre_sol)
-        breakdown = esthetics_breakdown_final(sol, data, weights, cluster_map, lam=lam)
+        breakdown = esthetics_breakdown_final(sol, data, weights, lam=lam)
         print(f"\n--- {nombre_sol} ---")
         print(f"  - Costo Operativo: {costo:,.2f}")
         print(f"  - Penalización Estética Cruda: {lam * pen:,.2f}")

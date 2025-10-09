@@ -1,0 +1,480 @@
+\documentclass[11pt, a4paper]{article}
+
+% =========================
+% Idioma y codificación
+% =========================
+\usepackage[spanish, es-nodecimaldot, es-tabla]{babel}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+
+% =========================
+% Márgenes y tipografía
+% =========================
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{microtype}
+\usepackage{setspace}
+\usepackage{lmodern}
+
+% =========================
+% Matemáticas
+% =========================
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{siunitx}
+
+% =========================
+% Figuras, tablas y color
+% =========================
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, calc, positioning}
+
+
+\usepackage[ruled,vlined,linesnumbered]{algorithm2e} % algoritmo
+\SetKwInput{KwIn}{Entrada}   % define \KwIn{...}
+\SetKwInput{KwOut}{Salida}   % define \KwOut{...}
+
+
+% =========================
+% Referencias y enlaces
+% =========================
+\usepackage[hidelinks]{hyperref}
+\usepackage[nameinlink, noabbrev]{cleveref}
+
+% =========================
+% Listas y utilidades
+% =========================
+\usepackage{enumitem}
+\setlist{itemsep=0.2em, topsep=0.2em}
+
+% =========================
+% Notación y comandos útiles
+% =========================
+\newcommand{\N}{\mathbb{N}}
+\newcommand{\R}{\mathbb{R}}
+\DeclareMathOperator{\CV}{CV}
+\newcommand{\abs}[1]{\left\lvert #1 \right\rvert}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+
+% =========================
+% Datos de portada (EDITA AQUÍ)
+% =========================
+\newcommand{\universidad}{Pontificia Universidad Católica de Chile}
+\newcommand{\escuela}{Escuela de Ingeniería}
+\newcommand{\curso}{Capstone / IIC2133 — VRPTW con Atractivo Visual}
+\newcommand{\titulo}{Modelo Matemático}
+\newcommand{\subtitulo}{Formulación VRPTW + Penalización de Atractivo Visual via Escalarización}
+\newcommand{\autores}{Rodrigo Villena, Equipo Capstone}
+\newcommand{\profesor}{Profesor: Nombre Apellido}
+\newcommand{\fecha}{\today}
+\newcommand{\logoPath}{figs/logo_uc.png} % opcional
+
+% =========================
+% Portada
+% =========================
+\begin{document}
+\begin{titlepage}
+    \centering
+    % \includegraphics[width=2.5cm]{\logoPath}\par\vspace{0.6cm}
+
+    {\Large \textbf{\universidad}}\\[0.2cm]
+    {\large \escuela}\\[1.8cm]
+
+    {\LARGE \textbf{\titulo}}\par
+    \vspace{0.2cm}
+    {\large \subtitulo}\par
+    \vspace{1.4cm}
+
+    {\large \curso}\par
+    \vspace{1.2cm}
+
+    {\large \textbf{Autores:}} {\autores}\par
+    \vspace{0.4cm}
+    {\large \profesor}\par
+    \vspace{1.6cm}
+
+    {\large \fecha}\par
+
+    \vfill
+
+    \begin{flushleft}
+        \textbf{Resumen}. Este documento presenta una formulación VRPTW  (cobertura, flujo, capacidad, ventanas, propagación temporal)
+        y una escalarización multiobjetivo que incorpora penalizaciones geométricas
+        de “atractivo visual” (balance de carga, intrusión de hulls, dispersión
+        multi-factorial y conteo de cruces).
+    \end{flushleft}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+% =========================
+% 1. Introducción breve
+% =========================
+\section{Introducción}
+Las operaciones de última milla suelen modelarse como un \emph{Vehicle Routing Problem with Time Windows} (VRPTW), donde se decide el conjunto de rutas que minimiza costos y respeta capacidad, ventanas de tiempo y jornada. En la práctica, sin embargo, además del costo interesa la \emph{legibilidad operacional} de las rutas: que cada vehículo atienda una zona “propia”, compacta y sin interferencias innecesarias con las demás. Esta cualidad —que llamamos \emph{atractivo visual}— favorece la comprensión por parte de repartidores y planificadores, reduce errores de ejecución y simplifica el ajuste manual en terreno.
+
+El VRPTW clásico no controla explícitamente la forma territorial de las rutas: la geometría resultante es un subproducto del objetivo económico y de las restricciones. En este trabajo incorporamos ese aspecto mediante una escalarización multiobjetivo: mantenemos el componente de costo operativo y añadimos una penalidad geométrica agregada, $\Phi_{\text{est}}$, que captura propiedades deseables de las rutas (compactación, separación territorial, balance y ausencia de cruces). El problema resultante minimiza
+\[
+Z(\lambda)=\text{Costo Operativo}+\lambda\,\Phi_{\text{est}}(x,y),
+\]
+donde $\lambda\ge 0$ gobierna el compromiso costo–estética y $\Phi_{\text{est}}$ se descompone en términos normalizados y escala–invariantes (ver \S\ref{eq:phi}).
+
+\paragraph{Aporte.} El trabajo propone:
+\begin{itemize}[leftmargin=1.4em]
+    \item Una formulación VRPTW estándar con escalarización estética (costo $+$ penalidades geométricas) que permite trazar \emph{frontiers de Pareto} costo–atractivo visual variando $\lambda$.
+    \item Un conjunto de métricas geométricas robustas y normalizadas en $[0,1]$: (i) \emph{dispersión multi-factorial} por ruta (compacidad tipo Polsby–Popper, excentricidad, variación radial y zigzag angular), (ii) \emph{intrusión de envolventes convexas} entre rutas, (iii) \emph{conteo de cruces} intra/inter-ruta y (iv) \emph{balance} de longitud y de paradas.
+    \item Procedimientos computacionales eficientes basados en geometría computacional (cascos convexos, recorte segmento–polígono con filtros por \emph{bounding boxes}) y \emph{caches} reutilizables para evaluación rápida dentro de la heurística.
+    \item Una metaheurística ALNS que integra las penalidades en la evaluación incremental, manteniendo factibilidad y permitiendo modular la presión estética sin sacrificar desempeño.
+\end{itemize}
+
+\paragraph{Lectura del documento.} La \S2 presenta la formulación matemática (conjuntos, variables, restricciones) y define en detalle $\Phi_{\text{est}}$ y sus componentes. La \S3 describe la heurística ALNS, los operadores y el esquema de aceptación. Anexos (si aplica) incluyen detalles de implementación y experimentos adicionales.
+
+
+% =========================
+% 2. Modelo matemático
+% =========================
+\section{Modelo matemático}
+
+\subsection{Conjuntos}
+\begin{align*}
+&N=\{0,1,\dots,n\} && \text{nodos (0 = depósito)},\\
+&C=N\setminus\{0\} && \text{clientes},\\
+&K=\{1,\dots,m\} && \text{vehículos},\\
+&A=\{(i,j)\in N\times N:\ i\neq j\} && \text{arcos}.
+\end{align*}
+
+\subsection{Parámetros}
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+$c_{ij}\ge 0$ & distancia (m) entre $i$ y $j$,\\
+$t_{ij}\ge 0$ & tiempo de viaje entre $i$ y $j$,\\
+$d_i\ge 0$ & demanda del cliente $i$,\\
+$s_i\ge 0$ & tiempo de servicio en $i$,\\
+$Q_k>0$ & capacidad del vehículo $k$,\\
+$[a_i,b_i]$ & ventana de tiempo en $i\in N$,\\
+$[a_0,b_0]$ & jornada del depósito, $H=b_0-a_0$,\\
+$\mathrm{cost}_m\ge 0$ & costo por metro, \quad $\mathrm{fixed}_k\ge 0$ costo fijo por vehículo,\\
+$\lambda\ge 0$ & ponderador multiobjetivo,\\
+$\mathbf{w}=(w_{\text{disp}}, w_{\text{cr-intra}}, w_{\text{cr-inter}}, w_{\text{bal-dist}}, w_{\text{bal-stops}}, w_{\text{intr}})$ 
+& pesos de penalización estética.\\
+\end{tabularx}
+
+
+\subsection{Variables}
+\begin{align*}
+&x_{ijk}\in\{0,1\} && \text{1 si el vehículo } k \text{ viaja de } i \text{ a } j,\\
+&y_{ik}\in\{0,1\} && \text{1 si el cliente } i \text{ es atendido por } k,\\
+&u_k\in\{0,1\} && \text{1 si se usa el vehículo } k,\\
+&T_{ik}\ge 0 && \text{inicio de servicio en } i \text{ por } k,\\
+&L_k\ge 0,\; S_k\ge 0 && \text{longitud y nº de paradas de la ruta } k.
+\end{align*}
+
+\subsection{Función objetivo}
+\[
+\min\ Z(\lambda)\;=\;\underbrace{\sum_{k\in K}\sum_{(i,j)\in A}\!\!\mathrm{cost}_m\,c_{ij}\,x_{ijk}
+\;+\;\sum_{k\in K}\mathrm{fixed}_k\,u_k}_{\text{Costo operativo}}
+\;+\;
+\lambda\cdot \Phi_{\text{est}}(x,y).
+\]
+
+\subsection{Penalidades Estéticas}
+La función de penalidad estética combina múltiples métricas que capturan diferentes aspectos del atractivo visual de las rutas:
+
+\begin{align}
+\Phi_{\text{est}}(x,y)
+=\; &w_{\text{disp}}\cdot \mathcal{D}(x) &&\text{(dispersión geométrica)}\nonumber\\
+   &+ w_{\text{cr-intra}}\cdot \mathcal{X}^{\text{intra}}(x) &&\text{(cruces dentro de rutas)}\nonumber\\
+   &+ w_{\text{cr-inter}}\cdot \mathcal{X}^{\text{inter}}(x) &&\text{(cruces entre rutas)}\nonumber\\
+   &+ w_{\text{bal-dist}}\cdot \CV\!\big(\{L_k\}_{k\in K}\big) &&\text{(balance de distancias)}\nonumber\\
+   &+ w_{\text{bal-stops}}\cdot \CV\!\big(\{S_k\}_{k\in K}\big) &&\text{(balance de paradas)}\nonumber\\
+   &+ w_{\text{intr}}\cdot \mathcal{I}(x) &&\text{(intrusión entre rutas)} \label{eq:phi}
+\end{align}
+
+Cada término captura un aspecto diferente del atractivo visual:
+
+\begin{itemize}
+\item \textbf{Dispersión geométrica} ($\mathcal{D}$): Mide qué tan compacta y "bien formada" es cada ruta. Una ruta ideal debería formar una figura geométrica simple y compacta, sin zigzags innecesarios o desvíos abruptos.
+
+\item \textbf{Cruces intra-ruta} ($\mathcal{X}^{\text{intra}}$): Cuenta cuántas veces una ruta se cruza consigo misma. Idealmente, una ruta no debería cruzarse a sí misma, ya que esto sugiere ineficiencia y crea patrones visuales confusos.
+
+\item \textbf{Cruces inter-ruta} ($\mathcal{X}^{\text{inter}}$): Cuenta los cruces entre diferentes rutas. Las rutas que se cruzan entre sí crean puntos de confusión visual y sugieren una mala distribución territorial.
+
+\item \textbf{Balance de distancias} ($\CV\{\text{L}_k\}$): Mide la variabilidad relativa en las distancias recorridas por cada vehículo, usando el coeficiente de variación (CV = desviación estándar / media). Un bajo CV indica que las rutas están bien balanceadas en términos de distancia.
+
+\item \textbf{Balance de paradas} ($\CV\{\text{S}_k\}$): Similar al balance de distancias, pero considerando el número de paradas por ruta. Busca distribuir equitativamente la carga de trabajo entre los vehículos.
+
+\item \textbf{Intrusión entre rutas} ($\mathcal{I}$): Mide cuánto se "invaden" las rutas entre sí, considerando sus áreas de influencia. Cada ruta debería operar en su propia zona territorial sin interferir significativamente con otras.
+\end{itemize}
+
+Los pesos $w$ permiten ajustar la importancia relativa de cada aspecto según las prioridades específicas del problema.
+
+
+\noindent
+\textit{Notas.} 
+$\mathcal{I}$ (intrusión de envolventes convexas), 
+$\mathcal{D}$ (dispersión geométrica por ruta) y 
+$\mathcal{X}^{\text{intra}}/\mathcal{X}^{\text{inter}}$ (cruces intra/inter)
+son métricas geométricas evaluadas ex--post sobre las polilíneas de las rutas.
+
+\section{Métricas Visuales en Detalle}
+
+\subsection{Dispersión Geométrica $\mathcal{D}(x)$}
+
+La dispersión geométrica analiza la forma y estructura de cada ruta individualmente, combinando múltiples aspectos geométricos para evaluar qué tan "bien formada" está la ruta.
+
+\paragraph{Construcción:} Para cada ruta activa $k$ con lista de clientes $R_k$:
+\begin{enumerate}
+\item Proyectamos las coordenadas geográficas a un plano local $(x,y)$ centrado en el depósito
+\item Calculamos:
+   \begin{itemize}
+   \item $H_k$: casco convexo de los puntos de la ruta
+   \item $A_k$: área del casco convexo
+   \item $P_k$: perímetro del casco convexo
+   \item $\Sigma_k$: matriz de covarianza $2{\times}2$ de las coordenadas
+   \item $\lambda_{1k}\ge\lambda_{2k}$: autovalores de $\Sigma_k$
+   \item $r_{ik}$: distancia de cada cliente al baricentro
+   \item $\sigma_{rk},\mu_{rk}$: desviación estándar y media de $\{r_{ik}\}$
+   \item $\theta_{ik}$: ángulos "desenrollados" de los puntos en orden de visita
+   \end{itemize}
+\end{enumerate}
+
+\paragraph{Componentes:} Definimos cuatro métricas normalizadas que capturan diferentes aspectos de la forma:
+\begin{align*}
+&C^{\text{pp}}_k = \frac{4\pi A_k}{P_k^2} &&\text{(índice de compacidad circular)}\\
+&E_k = \min\!\left(\frac{\lambda_{1k}}{\lambda_{2k}},\, 1 + e_{\max}\right) &&\text{(excentricidad acotada)}\\
+&R_k = \frac{\sigma_{rk}/\mu_{rk}}{1+\sigma_{rk}/\mu_{rk}} &&\text{(variabilidad radial normalizada)}\\
+&Z_k = \frac{\#\{\text{cambios de signo en }\Delta\theta_{ik}\}}{\max\{1,|R_k|-2\}} &&\text{(índice de zigzag)}
+\end{align*}
+
+\paragraph{Interpretación de los Componentes:}
+\begin{itemize}
+\item $C^{\text{pp}}_k$ (Compacidad): Mide qué tan circular es la forma de la ruta. El valor máximo de 1 se alcanza para un círculo perfecto, mientras que valores más bajos indican formas más irregulares o alargadas.
+
+\item $E_k$ (Excentricidad): Captura qué tan "alargada" es la ruta comparando sus ejes principal y secundario. Un valor cercano a 1 indica una forma equilibrada, mientras que valores más altos indican formas muy alargadas.
+
+\item $R_k$ (Variabilidad Radial): Evalúa qué tan uniforme es la distribución de puntos desde el centro de la ruta. Valores bajos indican una distribución más uniforme, mientras que valores altos sugieren agrupaciones irregulares.
+
+\item $Z_k$ (Zigzag): Detecta cambios bruscos en la dirección de la ruta. Un valor bajo indica una ruta suave y fluida, mientras que valores altos sugieren muchos giros y cambios de dirección innecesarios.
+\end{itemize}
+con $e_{\max}=5$. La penalidad de forma de la ruta es
+\paragraph{Penalidad por Forma:} Los componentes se combinan en una única medida de penalidad por ruta:
+\[
+\psi_k = \alpha_1(1-C^{\text{pp}}_k) + \alpha_2\frac{E_k-1}{e_{\max}} + \alpha_3 R_k + \alpha_4 Z_k,
+\]
+donde los pesos por defecto son:
+\begin{itemize}
+\item $\alpha_1 = 0.4$: Mayor peso a la compacidad global
+\item $\alpha_2 = 0.3$: Penalización moderada por elongación excesiva
+\item $\alpha_3 = 0.2$: Peso intermedio para variabilidad radial
+\item $\alpha_4 = 0.1$: Menor peso para zigzags (pero sigue siendo importante)
+\end{itemize}
+
+\paragraph{Dispersión Total:} La métrica final se calcula como el promedio de las penalidades por ruta:
+\[
+\mathcal{D}(x) = \frac{1}{|\{k:R_k\neq\emptyset\}|}\sum_{k:|R_k|>1} \psi_k,
+\]
+donde $\psi_k=0$ para rutas con $|R_k|\le 1$ (rutas muy cortas no se penalizan).
+
+\paragraph{Ventajas del Enfoque:}
+\begin{itemize}
+\item Captura múltiples aspectos de la "calidad visual" de una ruta
+\item Normalizado entre 0 y 1 para facilitar la comparación
+\item Configurable mediante parámetros ($\alpha_1,\dots,\alpha_4$ y $e_{\max}$)
+\item Más robusto que métricas simples como "distancia media / distancia máxima"
+\item Penaliza específicamente patrones visualmente poco atractivos (zigzags, formas muy alargadas, distribuciones irregulares)
+\end{itemize}
+
+\paragraph{Configuración:} En la implementación, los parámetros son ajustables mediante:
+\begin{itemize}
+\item \texttt{dispersion\_shape\_weights}: Vector $(\alpha_1,\dots,\alpha_4)$
+\item \texttt{dispersion\_ecc\_cap}: Valor de $e_{\max}$ para acotar la excentricidad
+\end{itemize}
+
+\subsection{Restricciones VRPTW}
+\textbf{Cobertura}
+\[
+\sum_{k\in K}\sum_{j\in N:(i,j)\in A} x_{ijk} \;=\; 1 
+\quad \forall i\in C.
+\]
+
+\textbf{Flujo en clientes}
+\[
+\sum_{j\in N:(i,j)\in A} x_{ijk} \;=\; \sum_{j\in N:(j,i)\in A} x_{jik} \;=\; y_{ik}
+\quad \forall i\in C,\ \forall k\in K.
+\]
+
+\textbf{Salida y retorno al depósito}
+\[
+\sum_{j\in C} x_{0jk} \;=\; \sum_{i\in C} x_{i0k} \;=\; u_k \quad \forall k\in K.
+\]
+
+\textbf{Capacidad}
+\[
+\sum_{i\in C} d_i\,y_{ik} \;\le\; Q_k \quad \forall k\in K.
+\]
+
+\textbf{Ventanas de tiempo}
+\[
+a_i \;\le\; T_{ik} \;\le\; b_i \quad \forall i\in C,\ \forall k\in K.
+\]
+
+\textbf{Propagación temporal (Big-M)}
+\[
+T_{jk} \;\ge\; T_{ik} + s_i + t_{ij} - M\,(1 - x_{ijk})
+\quad \forall (i,j)\in A,\ \forall k\in K.
+\]
+
+\textbf{Jornada}
+\[
+T_{0k} + \sum_{(i,j)\in A} t_{ij}\,x_{ijk} + \sum_{i\in C} s_i\,y_{ik} \;\le\; b_0
+\quad \forall k\in K.
+\]
+
+\textbf{Dominio}
+\[
+x_{ijk},y_{ik},u_k\in\{0,1\},\quad T_{ik}\ge 0.
+\]
+
+% =========================
+% 3. Modelo algorítmico: ALNS
+% =========================
+\section{Modelo algorítmico: Heurística ALNS}
+
+En esta sección modelamos la metaheurística \emph{Adaptive Large Neighborhood Search} (ALNS) usada para aproximar el óptimo del problema definido en \S2. Denotamos por $Z(\cdot)$ la función objetivo completa de \S2 (costo + $\lambda$·penalidad).
+
+\subsection{Representación de soluciones y operadores}
+Una solución $S$ es un conjunto ordenado de rutas factibles $S=(R_1,\dots,R_{m'})$ con $m'\le m$, donde cada $R_k$ es una secuencia que parte y termina en el depósito y satisface capacidad y ventanas.
+
+La ALNS usa familias de operadores:
+\begin{itemize}[leftmargin=1.4em]
+\item \textbf{Destrucción} $\mathcal{D}=\{D_1,\dots,D_{n_D}\}$: remueven un subconjunto $U\subseteq C$ de tamaño $q$ desde $S$ para formar una solución parcial $S^{-U}$. Ejemplos: \emph{Random}, \emph{Shaw} (basado en similitud), \emph{Worse removal}, \emph{Segment removal}.
+\item \textbf{Reparación} $\mathcal{R}=\{R_1,\dots,R_{n_R}\}$: reinsertan iterativamente los clientes de $U$ en $S^{-U}$ para obtener $S'$, respetando factibilidad. Ejemplos: \emph{Greedy cheapest insertion}, \emph{Regret-$k$}.
+\end{itemize}
+
+\paragraph{Similitud para \emph{Shaw}.}
+Cuando se usa un operador tipo Shaw, la similitud entre clientes $i,j$ puede modelarse como
+\[
+\mathrm{sim}(i,j)=\alpha_1\,c_{ij}
++ \alpha_2\,|a_i-a_j|
++ \alpha_3\,|d_i-d_j|,
+\]
+con pesos $\alpha_\ell\ge 0$.
+
+\paragraph{Costo incremental de inserción.}
+Para reparar, el costo de insertar $i$ en la posición $(p,p{+}1)$ de una ruta $R$ se evalúa como
+\[
+\Delta Z_{i\to (p,p+1)} \;=\; \Delta\text{CostoOperativo} \;+\; \lambda\cdot\Delta\Phi_{\text{est}},
+\]
+y solo se consideran posiciones que preservan factibilidad (capacidad y ventanas). En \emph{regret-$k$} se inserta el $i$ que maximiza
+\[
+\mathrm{regret}_k(i)\;=\;\sum_{h=1}^{k}\Delta Z_{i}^{(h)}-\Delta Z_{i}^{(1)},
+\]
+donde $\Delta Z_{i}^{(h)}$ es el $h$-ésimo mejor costo de insertar $i$ en cualquier ruta/posición.
+
+\subsection{Selección adaptativa de operadores}
+Sea $\eta^D=(\eta_1^D,\dots,\eta_{n_D}^D)$ y $\eta^R=(\eta_1^R,\dots,\eta_{n_R}^R)$ los \emph{pesos de desempeño}.
+Las probabilidades de elegir operadores se definen por
+\[
+p_j^D=\frac{\eta_j^D}{\sum_{u=1}^{n_D}\eta_u^D},\qquad
+p_\ell^R=\frac{\eta_\ell^R}{\sum_{v=1}^{n_R}\eta_v^R}.
+\]
+La adaptación se hace por segmentos de longitud $\tau$ iteraciones. Si $n_j$ es el nº de veces que se usó el operador $j$ en el segmento, y $S_{j}$ la suma de puntajes obtenidos (definidos abajo), entonces al cierre de segmento:
+\[
+\eta_j^D \leftarrow (1-\rho)\,\eta_j^D + \rho\cdot \frac{S_{j}}{\max\{1,n_j\}},\quad
+\eta_\ell^R \leftarrow (1-\rho)\,\eta_\ell^R + \rho\cdot \frac{S_{\ell}}{\max\{1,n_\ell\}}.
+\]
+Parámetro $\rho\in(0,1]$ es el \emph{factor de reacción}.
+
+\paragraph{Esquema de puntajes.}
+Cada intento produce $S'$ desde $S$. Sea $\Delta=Z(S')-Z(S)$. Definimos el puntaje $s\in\{\sigma_1,\sigma_2,\sigma_3,0\}$:
+\[
+s=\begin{cases}
+\sigma_1 & \text{si } Z(S')<Z(S^\star) \text{ (nuevo mejor global)},\\
+\sigma_2 & \text{si } Z(S')<Z(S) \text{ (mejora del actual)},\\
+\sigma_3 & \text{si } S'\ \text{es aceptada sin mejorar},\\
+0 & \text{en otro caso.}
+\end{cases}
+\]
+Donde $S^\star$ es el mejor global conocido. Este $s$ se acumula tanto al operador de destrucción como al de reparación usados en la iteración.
+
+\subsection{Criterio de aceptación (SA)}
+Usamos \emph{Simulated Annealing} tipo Metrópolis:
+\[
+\Pr(\text{aceptar }S')=
+\begin{cases}
+1, & \Delta\le 0,\\
+\exp(-\Delta/T), & \Delta>0,
+\end{cases}
+\]
+con temperatura $T$ que decae geométricamente $T\leftarrow \alpha T$, $\alpha\in(0,1)$.
+Un arranque típico fija $T_0$ a partir de una tasa de aceptación objetivo $p_0\in(0,1)$ y una $\overline{\Delta}>0$ estimada en calentamiento:
+\[
+T_0 \;=\; -\,\frac{\overline{\Delta}}{\ln p_0}.
+\]
+
+\subsection{Estrategia de destrucción}
+Sea $q\in\{q_{\min},\dots,q_{\max}\}$ el número de clientes removidos (puede sortearse cada iteración). Dado $D_j\in\mathcal{D}$, se elige un \emph{semilla} $i$ (p.ej., al azar o por peor costo marginal) y se construye $U$ de tamaño $q$ según el criterio del operador (similitud, peor contribución, cercanía geográfica, etc.). Se elimina $U$ de las rutas y se repara con $R_\ell\in\mathcal{R}$.
+
+\subsection{Criterios de parada e intensificación}
+La búsqueda termina por cualquiera de: (i) nº máx. de iteraciones $I_{\max}$, (ii) tiempo límite, (iii) iteraciones sin mejora $I_{\text{idle}}$. Opcionalmente, si no hay mejoras por $I_{\text{idle}}$, se puede \emph{recalentar} $T\leftarrow \kappa T_0$ o hacer \emph{restart} desde $S^\star$.
+
+\subsection{Algoritmo (pseudocódigo)}
+\begin{algorithm}[H]
+\DontPrintSemicolon
+\SetAlgoLined
+
+\KwIn{Datos del VRPTW (ver \S\ref{sec:modelo}), conjuntos de operadores $\mathcal{D},\mathcal{R}$, parámetros $\tau,\rho,\sigma_{1,2,3},\alpha,T_0,I_{\max}$}
+\KwOut{Mejor solución $S^\star$}
+
+Construir solución inicial factible $S$ (p.ej.\ heurística golosa o regret) y evaluar $Z(S)$\;
+$S^\star\leftarrow S$;\quad $Z^\star\leftarrow Z(S)$;\quad $T\leftarrow T_0$\;
+Inicializar pesos $\eta^D,\eta^R>0$ (uniformes) y contadores de segmento\;
+
+\For{$t\leftarrow 1$ \KwTo $I_{\max}$}{
+  Elegir $D_j\sim p^D$ y $R_\ell\sim p^R$\;
+  Elegir $q\in[q_{\min},q_{\max}]$\;
+  $U\leftarrow D_j(S,q)$;\quad $S^{-U}\leftarrow S\setminus U$\;
+  $S'\leftarrow R_\ell(S^{-U},U)$ \tcp*{reparación factible}
+  Evaluar $Z(S')$\;
+
+  \eIf{$Z(S')<Z^\star$}{
+     $S^\star\leftarrow S'$;\, $Z^\star\leftarrow Z(S')$;\, $s\leftarrow \sigma_1$\;
+  }{
+     \eIf{$Z(S')<Z(S)$}{
+        $s\leftarrow \sigma_2$;\; $S\leftarrow S'$ \tcp*{aceptación por mejora}
+     }{
+        Aceptar $S'$ con prob.\ $\exp\!\big(-(Z(S')-Z(S))/T\big)$\;
+        \lIf{aceptada}{$s\leftarrow \sigma_3$;\; $S\leftarrow S'$}
+        \lElse{$s\leftarrow 0$}
+     }
+  }
+
+  Acumular $s$ en $D_j$ y $R_\ell$; incrementar $n_j,n_\ell$\;
+  \If{$t \bmod \tau = 0$}{
+     Actualizar $\eta^D,\eta^R$ con $\rho$ y promedios de puntajes del segmento\;
+     Reiniciar contadores de segmento\;
+  }
+  $T\leftarrow \alpha T$\;
+}
+\Return{$S^\star$}\;
+\caption{ALNS para VRPTW + criterio estético}
+\end{algorithm}
+
+
+\subsection{Observaciones}
+\begin{itemize}[leftmargin=1.4em]
+\item La evaluación $Z(\cdot)$ es exactamente la de \S2; por eso la ALNS “optimiza” costo y estética a la vez.
+\item Si se desea, pueden permitirse soluciones \emph{levemente infactibles} con penalización dinámico–adaptativa; aquí usamos reparación estrictamente factible.
+\item Complejidad por iteración dominada por la reparación: con inserción que revisa $O(n)$ posiciones por cliente removido, es $O(q\,n)$; con estructuras incrementales puede bajarse.
+\end{itemize}
+
+
+\end{document}

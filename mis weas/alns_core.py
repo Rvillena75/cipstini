@@ -14,8 +14,6 @@ import os
 from pathlib import Path
 
 import time
-
-from sklearn.cluster import KMeans
 from dataclasses import dataclass
 
 from tqdm import tqdm
@@ -147,48 +145,6 @@ def _route_shape_on_roads(route, data):
 
     _ROAD_SHAPE_CACHE[key] = shape
     return shape
-
-
-
-def precalculate_clusters(data: dict, n_clusters: Optional[int] = None) -> np.ndarray:
-    """
-    Agrupa los nodos de clientes en clusters geográficos usando K-Means.
-    El depot (nodo 0) no se incluye en el clustering.
-
-    Args:
-        data: El diccionario de datos cargado.
-        n_clusters: El número de clusters a crear. Si es None, se usará el número de vehículos (K).
-
-    Returns:
-        Un array de numpy donde el índice `i` contiene el ID del cluster para el nodo `i`.
-        El depot (índice 0) tendrá un ID de -1.
-    """
-    if n_clusters is None:
-        n_clusters = data["K"]
-
-    # Extraemos las coordenadas solo de los clientes (ignorando el depot en el índice 0)
-    client_nodes = np.array(data["nodes"][1:])
-    
-    if len(client_nodes) == 0 or len(client_nodes) < n_clusters:
-        print("[WARN] No hay suficientes clientes para el clustering. Se omite.")
-        cluster_map = np.full(data["N"], -1, dtype=int)
-        return cluster_map
-
-    print(f"Generando {n_clusters} zonas virtuales (clusters) para {data['N']-1} clientes...")
-    
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
-    kmeans.fit(client_nodes)
-    
-    # Creamos el mapa de clusters. El ID del cluster para el cliente `i` (índice 1..N-1)
-    # se encontrará en kmeans.labels_[i-1].
-    cluster_map = np.zeros(data["N"], dtype=int)
-    cluster_map[0] = -1  # Asignamos -1 al depot para identificarlo fácilmente
-    cluster_map[1:] = kmeans.labels_
-    
-    print("Zonas virtuales generadas.")
-    return cluster_map
-
-
 
 _ROUTE_DIST_CACHE = {}
 
@@ -567,69 +523,25 @@ def destroy_zone(
     sol: Solution,
     p: float,
     data: dict,
-    cluster_map: Optional[np.ndarray] = None,
 ) -> Tuple[Solution, List[int]]:
-    """Elimina clientes agrupados por una o más zonas virtuales."""
-    if cluster_map is None or len(cluster_map) == 0:
-        return destroy_random(sol, p=p, data=data)
-
-    all_clients = [i for r in sol.routes for i in r]
-    if not all_clients:
-        return Solution([r[:] for r in sol.routes]), []
-
-    cluster_to_clients: Dict[int, List[int]] = {}
-    for client in all_clients:
-        if client >= len(cluster_map):
-            continue
-        cid = int(cluster_map[client])
-        if cid < 0:
-            continue
-        cluster_to_clients.setdefault(cid, []).append(client)
-
-    if not cluster_to_clients:
-        return destroy_random(sol, p=p, data=data)
-
-    target = max(1, int(len(all_clients) * p))
-    clusters = list(cluster_to_clients.items())
-    random.shuffle(clusters)
-
-    removed: List[int] = []
-    for _, clients in clusters:
-        removed.extend(clients)
-        if len(removed) >= target:
-            break
-
-    seen = set()
-    removed_unique: List[int] = []
-    for client in removed:
-        if client not in seen:
-            removed_unique.append(client)
-            seen.add(client)
-
-    removed_set = set(removed_unique)
-    new_routes = [[i for i in r if i not in removed_set] for r in sol.routes]
-    return Solution(new_routes), removed_unique
+    """Mantiene compatibilidad delegando en la eliminación aleatoria."""
+    return destroy_random(sol, p=p, data=data)
 
 # --- Repair: Regret-k (regret=3 por defecto) ---
 def q_insert_regret(
     sol: Solution,
     removed: List[int],
     data: dict,
-    cluster_map: np.ndarray,
     weights: dict,
     lam: float = 0.0,
     k: int = 3,
     cache: Optional[EstheticCache] = None,
 ) -> Solution:
-    """
-    Versión mejorada de Regret-k que es "consciente" de las zonas.
-    Al calcular el costo de una inserción, no solo considera la distancia,
-    sino también si la inserción crea dispersión o solapamiento de zonas.
-    """
+    """Versión Regret-k que evalúa costo y penalización estética de las inserciones."""
     routes = [r[:] for r in sol.routes]
     pen_cache: Dict[Tuple[Tuple[int, ...], ...], float] = {}
     cost_cache: Dict[Tuple[Tuple[int, ...], ...], float] = {}
-    esthetic_cache = cache or EstheticCache(data, cluster_map)
+    esthetic_cache = cache or EstheticCache(data)
 
     def _evaluate(candidate_routes: List[List[int]]) -> Tuple[float, float, float]:
         active = [rt for rt in candidate_routes if rt]
@@ -652,17 +564,12 @@ def q_insert_regret(
                 pen = pen_cache[key]
             else:
                 sol_obj = sol_obj or Solution([rt[:] for rt in active])
-                pen = aesthetic_penalty(sol_obj, data, cluster_map, weights, cache=esthetic_cache)
+                pen = aesthetic_penalty(sol_obj, data, weights, cache=esthetic_cache)
                 pen_cache[key] = pen
 
         return cost, pen, cost + lam * pen
 
-    baseline_sol = Solution([r[:] for r in routes if r])
     baseline_cost, baseline_pen, _ = _evaluate([r[:] for r in routes])
-
-    # Pre-calcula los clusters atendidos por cada ruta para eficiencia
-    clusters_por_ruta = [set(cluster_map[c] for c in r) for r in routes]
-    todos_los_clusters_atendidos = set.union(*clusters_por_ruta) if clusters_por_ruta else set()
 
     max_cap = max(map(float, data["vehicle_caps"])) if data["vehicle_caps"] else 0.0
 
@@ -750,21 +657,13 @@ def q_insert_regret(
         if ins['new_route']:
             new_route = list(ins['route'])
             routes.append(new_route)
-            clusters_por_ruta.append(set(cluster_map[c] for c in new_route))
         else:
             idx = int(ins['ri'])
             new_route = list(ins['route'])
             if idx < len(routes):
                 routes[idx] = new_route
-                if idx < len(clusters_por_ruta):
-                    clusters_por_ruta[idx] = set(cluster_map[c] for c in new_route)
-                else:
-                    clusters_por_ruta.append(set(cluster_map[c] for c in new_route))
             else:
                 routes.append(new_route)
-                clusters_por_ruta.append(set(cluster_map[c] for c in new_route))
-
-        todos_los_clusters_atendidos = set().union(*clusters_por_ruta) if clusters_por_ruta else set()
         removed.remove(cust)
 
         baseline_cost = ins.get('cost', baseline_cost)
@@ -1018,7 +917,6 @@ def _all_clients_assigned(sol: Solution, data: Dict) -> bool:
 def alns_single_run(
     data: Dict,
     weights,
-    cluster_map: np.ndarray,  # <-- AÑADE ESTE PARÁMETRO
     lam: float,
     iters: int = 2000,
     seed: int = 0,
@@ -1033,7 +931,7 @@ def alns_single_run(
     random.seed(seed)
     np.random.seed(seed)
 
-    esthetic_cache = EstheticCache(data, cluster_map)
+    esthetic_cache = EstheticCache(data)
 
 
 # Sólo activa si quieres analizar tiempos o generar reportes detallados
@@ -1047,7 +945,7 @@ def alns_single_run(
         # VAMOS A MODIFICAR ESTA FUNCIÓN INTERNA
         def eval_est_full(sol: Solution) -> float:
             if sol.est_penalty is None:
-                sol.est_penalty = aesthetic_penalty(sol, data, cluster_map, weights, cache=esthetic_cache)
+                sol.est_penalty = aesthetic_penalty(sol, data, weights, cache=esthetic_cache)
             return sol.est_penalty
 
         def eval_est_fast(sol: Solution) -> float:
@@ -1101,13 +999,10 @@ def alns_single_run(
 
             # --- b. Destrucción y Reparación ---
             op_args = {'p': destroy_p, 'data': data}
-            if chosen_name == 'zone':
-                op_args['cluster_map'] = cluster_map
-
             destroyed, removed = chosen_op_data['op'](curr, **op_args)
         
             # ¡Llama a la nueva función de reparación con los argumentos extra!
-            cand = q_insert_regret(destroyed, removed, data, cluster_map, weights, lam=lam, k=3, cache=esthetic_cache)
+            cand = q_insert_regret(destroyed, removed, data, weights, lam=lam, k=3, cache=esthetic_cache)
 
             # --- c. Búsqueda Local Intensiva (VNS) ---
             keep_searching_vns = True
@@ -1171,11 +1066,10 @@ def alns_single_run(
 
 
 # ----------  MULTI-OBJETIVO POR PONDERACIÓN ----------
-def run_pareto(data, weights, cluster_map, lambdas=(0.0, 0.5, 1.0, 2.0, 5.0), iters=2000, seed=42, use_fast_esthetics=False): # <-- AÑADE cluster_map
+def run_pareto(data, weights, lambdas=(0.0, 0.5, 1.0, 2.0, 5.0), iters=2000, seed=42, use_fast_esthetics=False):
     sols = []
     for lam in lambdas:
-        # Pasa el cluster_map a la llamada de alns_single_run
-        s = alns_single_run(data, weights, cluster_map, lam=lam, iters=iters, seed=seed, use_fast_esthetics=use_fast_esthetics) # <-- AÑADE cluster_map
+        s = alns_single_run(data, weights, lam=lam, iters=iters, seed=seed, use_fast_esthetics=use_fast_esthetics)
         sols.append((lam, s.cost, s.est_penalty, s))
         print(f"Lambda: {lam}, Costo: {s.cost:.2f}, Penalidad: {s.est_penalty:.2f}")
     # quitar dominadas (min costo, min estética)
@@ -1322,22 +1216,20 @@ def export_pareto_dual_maps(data, pareto, output_dir="soluciones"):
 
 
 
-def run_single_experiment(base_seed: int, data: dict, weights: dict, lambdas: list, iters: int, cluster_map: np.ndarray) -> list:
+def run_single_experiment(base_seed: int, data: dict, weights: dict, lambdas: list, iters: int) -> list:
     """
     Ejecuta una corrida completa del algoritmo para todos los lambdas con una semilla base.
-    Recibe el cluster_map pre-calculado.
     """
     print(f"\n--- INICIANDO CORRIDA CON SEED BASE = {base_seed} ---")
 
     # Ejecuta run_pareto, que a su vez llama a alns_single_run para cada lambda
     sols, pareto = run_pareto(
-        data, 
-        weights, 
-        cluster_map,
-        lambdas=lambdas, 
+        data,
+        weights,
+        lambdas=lambdas,
         iters=iters,
         seed=base_seed,
-        use_fast_esthetics=False 
+        use_fast_esthetics=False
     )
 
     print(f"--- CORRIDA CON SEED BASE = {base_seed} FINALIZADA ---")
