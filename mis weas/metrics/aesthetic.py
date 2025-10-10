@@ -8,18 +8,16 @@ import numpy as np
 
 from .balance_dist import compute_balance_distance_cv
 from .balance_stops import compute_balance_stops_cv
-from .compactness import compute_route_compactness_penalty
 from .cruces_intra import count_self_crossings
 from .cruces_inter import (
     count_between_routes_crossings,
     count_total_inter_route_crossings,
     count_inter_route_crossings,
-    count_route_cuts,
-    route_cuts_norm,
 )
 from .dispersion import compute_dispersion, route_shape_penalty
-from .intrusion import compute_intrusion_km, intrusion_length_between_routes_m
-from .solapamiento_geometrico import inter_route_area_overlap_score
+from .complexity import route_complexity, compute_complexity
+from .coherence import compute_coherence
+from .intrusion import compute_intrusion_km
 
 try:  # pragma: no cover - optional dependency
     from line_profiler import profile as line_profile
@@ -72,14 +70,14 @@ class EstheticCache:
         self.lat0, self.lon0 = self.nodes[0]
         self.nodes_xy = [self._to_xy_point(self.nodes[i][0], self.nodes[i][1]) for i in range(len(self.nodes))]
         disp_w = data.get("dispersion_shape_weights")
-        if disp_w is not None and len(disp_w) == 4:
-            self.disp_weights = tuple(float(w) for w in disp_w)
+        if disp_w is not None and len(disp_w) >= 3:
+            self.disp_weights = tuple(float(w) for w in disp_w[:3])
         else:
-            self.disp_weights = (0.4, 0.3, 0.2, 0.1)
+            self.disp_weights = (0.45, 0.35, 0.20)
         self.disp_e_cap = float(data.get("dispersion_ecc_cap", 5.0))
         self.route_cache: Dict[Tuple[int, ...], Dict[str, float]] = {}
         self.pair_cache: Dict[Tuple[Tuple[int, ...], Tuple[int, ...]], Dict[str, float]] = {}
-        self.intrusion_data = {"nodes": self.nodes}
+        self.intrusion_data = {"nodes": self.nodes, "nodes_xy": self.nodes_xy}
 
     def _to_xy_point(self, lat: float, lon: float) -> Tuple[float, float]:
         import math
@@ -101,19 +99,6 @@ class EstheticCache:
         dist += self.distM[route[-1], 0]
         return float(dist)
 
-    def _route_length_m(self, route: List[int]) -> float:
-        if not route:
-            return 0.0
-        import math
-
-        path = [0] + route + [0]
-        total = 0.0
-        for a, b in zip(path, path[1:]):
-            x1, y1 = self.nodes_xy[a]
-            x2, y2 = self.nodes_xy[b]
-            total += math.hypot(x2 - x1, y2 - y1)
-        return float(total)
-
     def route_metrics(self, key: Tuple[int, ...], route: List[int]) -> Dict[str, float]:
         cached = self.route_cache.get(key)
         if cached is not None:
@@ -124,7 +109,7 @@ class EstheticCache:
             'cruces_intra': 0.0,
             'distance': 0.0,
             'stops': float(len(route)),
-            'length_m': 0.0,
+            'complexity': 0.0,
         }
         if route:
             metrics['dispersion'] = float(
@@ -137,7 +122,7 @@ class EstheticCache:
             )
             metrics['cruces_intra'] = float(count_self_crossings(route, self.nodes))
             metrics['distance'] = self._route_distance(route)
-            metrics['length_m'] = self._route_length_m(route)
+            metrics['complexity'] = float(route_complexity(route, self.nodes_xy))
 
         self.route_cache[key] = metrics
         return metrics
@@ -159,23 +144,14 @@ class EstheticCache:
         if not route_a or not route_b:
             entry = {
                 'cross': 0.0,
-                'cuts': 0.0,
-                'cuts_denom': 0.0,
-                'intr_len': 0.0,
             }
             self.pair_cache[pair_key] = entry
             return entry
 
-        cuts, denom = count_route_cuts([route_a, route_b], self.nodes, self.distM, depot_id=0, depot_relief_m=1000.0, angle_weight=True)
         cross = count_inter_route_crossings(route_a, route_b, self.nodes)
-        intr_ratio = intrusion_length_between_routes_m([route_a, route_b], self.intrusion_data)
-        intr_len = intr_ratio * (data_a['length_m'] + data_b['length_m'])
 
         entry = {
             'cross': float(cross),
-            'cuts': float(cuts),
-            'cuts_denom': float(denom),
-            'intr_len': float(intr_len),
         }
         self.pair_cache[pair_key] = entry
         return entry
@@ -186,12 +162,12 @@ class EstheticCache:
             return {
                 'dispersion': 0.0,
                 'cruces_intra': 0.0,
-                'cross_geom': 0.0,
-                'cuts_ratio': 0.0,
+                'cruces_inter': 0.0,
                 'intrusion_ratio': 0.0,
+                'complexity': 0.0,
+                'coherence': 0.0,
                 'distances': [],
                 'stops': [],
-                'length_total': 0.0,
             }
 
         route_keys = [tuple(r) for r in routes]
@@ -199,34 +175,29 @@ class EstheticCache:
 
         dispersion = sum(info['dispersion'] for info in infos) / n
         cruces_intra = sum(info['cruces_intra'] for info in infos) / n
+        complexity = sum(info.get('complexity', 0.0) for info in infos) / n
         distances = [info['distance'] for info in infos]
         stops = [info['stops'] for info in infos]
-        length_total = sum(info['length_m'] for info in infos)
 
         cross_sum = 0.0
-        cuts_sum = 0.0
-        cuts_denom = 0.0
-        intr_len_sum = 0.0
         pairs = 0
         for i in range(n):
             for j in range(i + 1, n):
                 pair = self.pair_metrics(route_keys[i], routes[i], infos[i], route_keys[j], routes[j], infos[j])
                 cross_sum += pair['cross']
-                cuts_sum += pair['cuts']
-                cuts_denom += pair['cuts_denom']
-                intr_len_sum += pair['intr_len']
                 pairs += 1
 
-        cross_geom = cross_sum / max(1, pairs)
-        cuts_ratio = (cuts_sum / max(1.0, cuts_denom)) if cuts_denom > 0 else 0.0
-        intrusion_ratio = intr_len_sum / max(length_total, 1e-9)
+        cross_avg = cross_sum / max(1, pairs)
+        intrusion_ratio = compute_intrusion_km(routes, self.intrusion_data)
+        coherence_ratio = compute_coherence(routes, self.intrusion_data, nodes_xy=self.nodes_xy)
 
         return {
             'dispersion': dispersion,
             'cruces_intra': cruces_intra,
-            'cross_geom': cross_geom,
-            'cuts_ratio': cuts_ratio,
+            'cruces_inter': cross_avg,
             'intrusion_ratio': intrusion_ratio,
+            'complexity': complexity,
+            'coherence': coherence_ratio,
             'distances': distances,
             'stops': stops,
         }
@@ -288,14 +259,35 @@ def _log_metrics_from_solution(sol, data) -> Dict[str, float]:
         return {
             "cross_intra_norm": 0.0,
             "cross_inter_norm": 0.0,
-            "overlap": 0.0,
-            "balance_cv": 0.0,
-            "stops_cv": 0.0,
-            "compact_mean": 0.0,
-            "route_cuts_norm": 0.0,
+            "balance_dist_cv": 0.0,
+            "balance_stops_cv": 0.0,
+            "dispersion": 0.0,
+            "intrusion": 0.0,
+            "complexity": 0.0,
+            "coherence": 0.0,
         }
 
     nodes, distM = data["nodes"], data["distM"]
+    nodes_xy = data.get("nodes_xy")
+    if nodes_xy is None:
+        lat0, lon0 = nodes[0]
+        lat0_r = math.radians(lat0)
+        lon0_r = math.radians(lon0)
+        nodes_xy = []
+        for lat, lon in nodes:
+            lat_r = math.radians(lat)
+            lon_r = math.radians(lon)
+            x = _R_EARTH * (lon_r - lon0_r) * math.cos(0.5 * (lat_r + lat0_r))
+            y = _R_EARTH * (lat_r - lat0_r)
+            nodes_xy.append((x, y))
+        data["nodes_xy"] = nodes_xy
+    raw_disp_w = data.get("dispersion_shape_weights")
+    if raw_disp_w is not None and len(raw_disp_w) >= 3:
+        disp_weights = tuple(float(w) for w in raw_disp_w[:3])
+    else:
+        disp_weights = (0.45, 0.35, 0.20)
+    disp_e_cap = float(data.get("dispersion_ecc_cap", 5.0))
+
     dists = [_route_distance(r, distM) for r in routes]
     mean_dist = sum(dists) / max(1, len(dists))
 
@@ -315,22 +307,31 @@ def _log_metrics_from_solution(sol, data) -> Dict[str, float]:
             denom_inter += segs_per_route[i] * segs_per_route[j]
     cross_inter_norm = crosses_inter / max(1, denom_inter)
 
-    overlap = inter_route_area_overlap_score(routes, nodes, include_depot=False, depot_id=0)
     balance_cv = (float(np.std(dists)) / (mean_dist + 1e-9)) if dists else 0.0
     stops = [len(r) for r in routes]
     mean_stops = sum(stops) / max(1, len(stops))
     stops_cv = (float(np.std(stops)) / (mean_stops + 1e-9)) if stops else 0.0
-    compact_mean = float(np.mean([compute_route_compactness_penalty(r, distM) for r in routes])) if routes else 0.0
-    cuts = route_cuts_norm(routes, nodes, distM, depot_id=0, depot_relief_m=2000.0, angle_weight=True)
+    dispersion = compute_dispersion(
+        routes,
+        nodes,
+        nodes_xy,
+        weights=disp_weights,
+        e_cap=disp_e_cap,
+    )
+    geom_data = {"nodes": nodes, "nodes_xy": nodes_xy}
+    intrusion = compute_intrusion_km(routes, geom_data)
+    complexity = compute_complexity(routes, nodes, nodes_xy)
+    coherence = compute_coherence(routes, geom_data, nodes_xy=nodes_xy)
 
     return {
         "cross_intra_norm": cross_intra_norm,
         "cross_inter_norm": cross_inter_norm,
-        "overlap": overlap,
-        "balance_cv": balance_cv,
-        "stops_cv": stops_cv,
-        "compact_mean": compact_mean,
-        "route_cuts_norm": cuts,
+        "balance_dist_cv": balance_cv,
+        "balance_stops_cv": stops_cv,
+        "dispersion": float(dispersion),
+        "intrusion": float(intrusion),
+        "complexity": float(complexity),
+        "coherence": float(coherence),
     }
 
 
@@ -340,7 +341,10 @@ def aesthetic_penalty(
     data: Dict,
     weights: Dict,
     cache: Optional[EstheticCache] = None,
+    enable_metrics: bool = True,
 ) -> float:
+    if not enable_metrics:
+        return 0.0
     total_start = time.perf_counter() if _PROFILE_ENABLED else None
     routes = [r for r in sol.routes if r]
     if _PROFILE_ENABLED:
@@ -355,12 +359,15 @@ def aesthetic_penalty(
             if _PROFILE_ENABLED and comp_start is not None:
                 _profile_add("cache_components", time.perf_counter() - comp_start)
 
+            # Métricas de forma
             pen_dispersion = comp["dispersion"]
+            pen_complexity = comp["complexity"]
             pen_cruces_intra = comp["cruces_intra"]
-            pen_cruces_inter_geom = comp["cross_geom"]
-            pen_cruces_inter_alt = comp["cuts_ratio"]
+            pen_cruces_inter = comp["cruces_inter"] * 3.0
             pen_intrusion_km = comp["intrusion_ratio"]
+            pen_coherence = comp["coherence"]
 
+            # Métricas de balance
             distances = np.array(comp["distances"], dtype=float)
             stops = np.array(comp["stops"], dtype=float)
             mean_dist = distances.mean() if distances.size else 0.0
@@ -371,12 +378,13 @@ def aesthetic_penalty(
             if _PROFILE_ENABLED:
                 for name in (
                     "dispersion",
+                    "complexity",
                     "cruces_intra",
-                    "cruces_inter_geom",
-                    "cruces_inter_alt",
+                    "cruces_inter",
                     "balance_dist",
                     "balance_stops",
                     "intrusion",
+                    "coherence",
                 ):
                     _profile_add(name, 0.0)
         else:
@@ -397,10 +405,10 @@ def aesthetic_penalty(
                     nodes_xy.append((x, y))
                 data["nodes_xy"] = nodes_xy
             raw_disp_w = data.get("dispersion_shape_weights")
-            if raw_disp_w is not None and len(raw_disp_w) == 4:
-                disp_weights = tuple(float(w) for w in raw_disp_w)
+            if raw_disp_w is not None and len(raw_disp_w) >= 3:
+                disp_weights = tuple(float(w) for w in raw_disp_w[:3])
             else:
-                disp_weights = (0.4, 0.3, 0.2, 0.1)
+                disp_weights = (0.45, 0.35, 0.20)
             disp_e_cap = float(data.get("dispersion_ecc_cap", 5.0))
             if _PROFILE_ENABLED and setup_start is not None:
                 _profile_add("setup", time.perf_counter() - setup_start)
@@ -433,28 +441,11 @@ def aesthetic_penalty(
 
             if _PROFILE_ENABLED:
                 start = time.perf_counter()
-                pen_cruces_inter_geom = count_total_inter_route_crossings(routes, nodes)
-                _profile_add("cruces_inter_geom", time.perf_counter() - start)
-                start = time.perf_counter()
-                pen_cruces_inter_alt = route_cuts_norm(
-                    routes,
-                    nodes,
-                    distM,
-                    depot_id=0,
-                    depot_relief_m=1000.0,
-                    angle_weight=True,
-                )
-                _profile_add("cruces_inter_alt", time.perf_counter() - start)
+                pen_cruces_inter = count_total_inter_route_crossings(routes, nodes)
+                _profile_add("cruces_inter", time.perf_counter() - start)
             else:
-                pen_cruces_inter_geom = count_total_inter_route_crossings(routes, nodes)
-                pen_cruces_inter_alt = route_cuts_norm(
-                    routes,
-                    nodes,
-                    distM,
-                    depot_id=0,
-                    depot_relief_m=1000.0,
-                    angle_weight=True,
-                )
+                pen_cruces_inter = count_total_inter_route_crossings(routes, nodes)
+            pen_cruces_inter *= 3.0
 
             if _PROFILE_ENABLED:
                 start = time.perf_counter()
@@ -470,28 +461,35 @@ def aesthetic_penalty(
             else:
                 pen_balance_stops = compute_balance_stops_cv(routes)
 
-            if _PROFILE_ENABLED:
-                start = time.perf_counter()
-                pen_intrusion_km = compute_intrusion_km(routes, data)
-                _profile_add("intrusion", time.perf_counter() - start)
-            else:
-                pen_intrusion_km = compute_intrusion_km(routes, data)
+            shared_geom_data = {"nodes": nodes, "nodes_xy": nodes_xy}
 
-        pen_cruces_inter = max(pen_cruces_inter_geom, pen_cruces_inter_alt * 2.0) * 3.0
+            pen_complexity = compute_complexity(routes, nodes, nodes_xy)
+            pen_intrusion_km = compute_intrusion_km(routes, shared_geom_data)
+            pen_coherence = compute_coherence(routes, shared_geom_data, nodes_xy=nodes_xy)
 
-        metrics = {
-            "dispersion_rutas": pen_dispersion,
-            "cruces_intra_ruta": pen_cruces_intra,
-            "cruces_inter_ruta": pen_cruces_inter,
-            "desbalance_dist_cv": pen_balance_dist,
-            "desbalance_stops_cv": pen_balance_stops,
-            "intrusion": pen_intrusion_km,
-        }
+            metrics = {
+                # Métricas de forma
+                "dispersion_rutas": pen_dispersion,
+                "complexity_rutas": pen_complexity,
 
+                # Métricas de interferencia
+                "cruces_intra_ruta": pen_cruces_intra,
+                "cruces_inter_ruta": pen_cruces_inter,
+                "intrusion": pen_intrusion_km,
+
+                # Métricas de balance
+                "desbalance_dist_cv": pen_balance_dist,
+                "desbalance_stops_cv": pen_balance_stops,
+                # Coherencia territorial
+                "coherence_clientes": pen_coherence,
+            }
+
+        # Actualizar mapeo de nombres a claves de peso
         value = 0.0
         for name, metric in metrics.items():
             weight_key = WEIGHT_KEYS.get(name, "")
-            value += weights.get(weight_key, 0.0) * metric
+            if weight_key and weight_key in weights:
+                value += weights[weight_key] * metric
         value = float(value)
 
     if _CURRENT_LAMBDA is not None:
@@ -504,20 +502,92 @@ def aesthetic_penalty(
     return float(value)
 
 
+DEFAULT_FAST_WEIGHTS = {
+    "w_dispersion": 40.0,
+    "w_complexity": 35.0,
+    "w_cruces_intra": 30.0,
+    "w_cruces_inter": 40.0,
+    "w_balance_dist": 60.0,
+    "w_balance_stops": 60.0,
+    "w_intrusion": 400.0,
+    "w_coherence": 50.0,
+}
+
+
+def _ensure_nodes_xy(data: Dict) -> List[Tuple[float, float]]:
+    nodes = data["nodes"]
+    nodes_xy = data.get("nodes_xy")
+    if nodes_xy is None:
+        lat0, lon0 = nodes[0]
+        lat0_r = math.radians(lat0)
+        lon0_r = math.radians(lon0)
+        nodes_xy = []
+        for lat, lon in nodes:
+            lat_r = math.radians(lat)
+            lon_r = math.radians(lon)
+            x = _R_EARTH * (lon_r - lon0_r) * math.cos(0.5 * (lat_r + lat0_r))
+            y = _R_EARTH * (lat_r - lat0_r)
+            nodes_xy.append((x, y))
+        data["nodes_xy"] = nodes_xy
+    return nodes_xy
+
+
 def aesthetic_penalty_fast(sol, data: Dict) -> float:
     routes = [r for r in sol.routes if r]
     if not routes:
         return 0.0
+    nodes = data["nodes"]
     distM = data["distM"]
+    nodes_xy = _ensure_nodes_xy(data)
+
+    raw_disp_w = data.get("dispersion_shape_weights")
+    if raw_disp_w is not None and len(raw_disp_w) >= 3:
+        disp_weights = tuple(float(w) for w in raw_disp_w[:3])
+    else:
+        disp_weights = (0.45, 0.35, 0.20)
+    disp_e_cap = float(data.get("dispersion_ecc_cap", 5.0))
+
     dists = [_route_distance(r, distM) for r in routes]
-    balance = float(np.std(dists)) if dists else 0.0
+    mean_dist = np.mean(dists) if dists else 0.0
+    balance_dist = float(np.std(dists) / (mean_dist + 1e-9)) if dists else 0.0
+
     stops = [len(r) for r in routes]
-    stops_balance = float(np.std(stops)) if stops else 0.0
-    compactness = sum(compute_route_compactness_penalty(r, distM) for r in routes)
-    return (1.0 * balance) + (10.0 * stops_balance) + (50.0 * compactness)
+    mean_stops = np.mean(stops) if stops else 0.0
+    balance_stops = float(np.std(stops) / (mean_stops + 1e-9)) if stops else 0.0
+
+    cruces_intra = sum(count_self_crossings(r, nodes) for r in routes) / max(1, len(routes))
+    cruces_inter = count_total_inter_route_crossings(routes, nodes) * 3.0
+    dispersion = compute_dispersion(
+        routes,
+        nodes,
+        nodes_xy,
+        weights=disp_weights,
+        e_cap=disp_e_cap,
+    )
+    complexity = compute_complexity(routes, nodes, nodes_xy)
+    geom_data = {"nodes": nodes, "nodes_xy": nodes_xy}
+    intrusion = compute_intrusion_km(routes, geom_data)
+    coherence = compute_coherence(routes, geom_data, nodes_xy=nodes_xy)
+
+    weights = data.get("fast_metric_weights", DEFAULT_FAST_WEIGHTS)
+
+    return (
+        weights.get("w_dispersion", DEFAULT_FAST_WEIGHTS["w_dispersion"]) * float(dispersion)
+        + weights.get("w_complexity", DEFAULT_FAST_WEIGHTS["w_complexity"]) * float(complexity)
+        + weights.get("w_cruces_intra", DEFAULT_FAST_WEIGHTS["w_cruces_intra"]) * float(cruces_intra)
+        + weights.get("w_cruces_inter", DEFAULT_FAST_WEIGHTS["w_cruces_inter"]) * float(cruces_inter)
+        + weights.get("w_balance_dist", DEFAULT_FAST_WEIGHTS["w_balance_dist"]) * float(balance_dist)
+        + weights.get("w_balance_stops", DEFAULT_FAST_WEIGHTS["w_balance_stops"]) * float(balance_stops)
+        + weights.get("w_intrusion", DEFAULT_FAST_WEIGHTS["w_intrusion"]) * float(intrusion)
+        + weights.get("w_coherence", DEFAULT_FAST_WEIGHTS["w_coherence"]) * float(coherence)
+    )
 
 
 def esthetics_breakdown_final(sol, data: Dict, weights: Dict, lam: float = 1.0) -> Dict[str, float]:
+    key = getattr(sol, "_breakdown_cache_key", None)
+    if sol.breakdown_cache is not None and key == (lam, id(data)):
+        return sol.breakdown_cache
+
     routes = [r for r in sol.routes if r]
     if not routes:
         return {
@@ -526,14 +596,33 @@ def esthetics_breakdown_final(sol, data: Dict, weights: Dict, lam: float = 1.0) 
             "cruces_inter_ruta": 0.0,
             "desbalance_dist_cv": 0.0,
             "desbalance_stops_cv": 0.0,
+            "complexity_rutas": 0.0,
             "intrusion": 0.0,
+            "coherence_clientes": 0.0,
             "penalizacion_cruda": 0.0,
             "detalle_sin_pesos": {},
         }
 
+    if lam <= 0.0:
+        zeros = {
+            "dispersion_rutas": 0.0,
+            "cruces_intra_ruta": 0.0,
+            "cruces_inter_ruta": 0.0,
+            "desbalance_dist_cv": 0.0,
+            "desbalance_stops_cv": 0.0,
+            "complexity_rutas": 0.0,
+            "intrusion": 0.0,
+            "coherence_clientes": 0.0,
+        }
+        result = dict(zeros)
+        result["penalizacion_cruda"] = 0.0
+        result["penalizacion_cruda_sin_lambda"] = 0.0
+        result["detalle_sin_pesos"] = {k: float(v) for k, v in zeros.items()}
+        return result
+
     cache = EstheticCache(data)
     comp = cache.compute_components(routes)
-    pen_cruda = aesthetic_penalty(sol, data, weights, cache=cache)
+    pen_cruda = aesthetic_penalty(sol, data, weights, cache=cache, enable_metrics=True)
 
     distances = np.array(comp["distances"], dtype=float)
     stops = np.array(comp["stops"], dtype=float)
@@ -543,17 +632,21 @@ def esthetics_breakdown_final(sol, data: Dict, weights: Dict, lam: float = 1.0) 
     pen_balance_stops = float(np.std(stops) / (mean_stops + 1e-9)) if stops.size else 0.0
 
     pen_dispersion = comp["dispersion"]
+    pen_complexity = comp["complexity"]
     pen_cruces_intra = comp["cruces_intra"]
-    pen_cruces_inter = max(comp["cross_geom"], comp["cuts_ratio"] * 2.0) * 3.0
+    pen_cruces_inter = comp["cruces_inter"] * 3.0
     pen_intrusion = comp["intrusion_ratio"]
+    pen_coherence = comp["coherence"]
 
     metrics = {
         "dispersion_rutas": pen_dispersion,
+        "complexity_rutas": pen_complexity,
         "cruces_intra_ruta": pen_cruces_intra,
         "cruces_inter_ruta": pen_cruces_inter,
         "desbalance_dist_cv": pen_balance_dist,
         "desbalance_stops_cv": pen_balance_stops,
         "intrusion": pen_intrusion,
+        "coherence_clientes": pen_coherence,
     }
 
     scale = float(lam)
@@ -566,16 +659,20 @@ def esthetics_breakdown_final(sol, data: Dict, weights: Dict, lam: float = 1.0) 
     weighted_scaled["penalizacion_cruda_sin_lambda"] = float(pen_cruda)
     weighted_scaled["detalle_sin_pesos"] = {name: float(metric) for name, metric in metrics.items()}
 
+    sol.breakdown_cache = weighted_scaled
+    sol._breakdown_cache_key = (lam, id(data))
     return weighted_scaled
 
 
 WEIGHT_KEYS = {
     "dispersion_rutas": "w_dispersion",
+    "complexity_rutas": "w_complexity",
     "cruces_intra_ruta": "w_cruces_intra",
     "cruces_inter_ruta": "w_cruces_inter",
     "desbalance_dist_cv": "w_balance_dist",
     "desbalance_stops_cv": "w_balance_stops",
     "intrusion": "w_intrusion",
+    "coherence_clientes": "w_coherence",
 }
 
 __all__ = [

@@ -60,22 +60,10 @@ def _poly_area_perimeter(poly: List[Tuple[float,float]]):
         P += math.hypot(x2-x1, y2-y1)
     return abs(A)*0.5, P
 
-def _angles_unwrapped(xs, ys):
-    mx, my = sum(xs)/len(xs), sum(ys)/len(ys)
-    ang = [math.atan2(y-my, x-mx) for x,y in zip(xs,ys)]
-    # unwrap
-    out = [ang[0]]
-    for a in ang[1:]:
-        da = a - out[-1]
-        while da <= -math.pi: da += 2*math.pi
-        while da > math.pi:   da -= 2*math.pi
-        out.append(out[-1] + da)
-    return out
-
 def route_shape_penalty(
     route: List[int],
     nodes_xy: List[Tuple[float, float]],
-    weights: Optional[Tuple[float, float, float, float]] = None,
+    weights: Optional[Tuple[float, float, float]] = None,
     e_cap: float = 5.0,
 ) -> float:
     if len(route) <= 2:
@@ -107,34 +95,29 @@ def route_shape_penalty(
         cv = math.sqrt(var)/r_mean
         pen_rad = cv/(1.0 + cv)
 
-    # 4) Zigzag angular en el orden de la ruta
-    ang = _angles_unwrapped(xs, ys)
-    diffs = [ang[i+1]-ang[i] for i in range(len(ang)-1)]
-    signs = [1 if d>0 else (-1 if d<0 else 0) for d in diffs]
-    changes = sum(1 for i in range(len(signs)-1) if signs[i]*signs[i+1] < 0)
-    pen_ang = changes / max(1, len(diffs)-1)
-
     if weights is None:
-        w1, w2, w3, w4 = 0.4, 0.3, 0.2, 0.1
+        w1, w2, w3 = 0.45, 0.35, 0.20
     else:
-        w1, w2, w3, w4 = weights
-    score = w1*pen_pp + w2*pen_iso + w3*pen_rad + w4*pen_ang
+        if len(weights) != 3:
+            raise ValueError("weights for route_shape_penalty must have exactly 3 components")
+        w1, w2, w3 = weights
+    score = w1*pen_pp + w2*pen_iso + w3*pen_rad
     return max(0.0, min(1.0, score))
 
 def compute_dispersion(
     routes: List[List[int]],
     nodes: List[Tuple[float, float]],
     nodes_xy: Optional[List[Tuple[float, float]]] = None,
-    weights: Optional[Tuple[float, float, float, float]] = None,
+    weights: Optional[Tuple[float, float, float]] = None,
     e_cap: float = 5.0,
 ) -> float:
     """Average shape penalty for a set of routes.
 
     Each route is evaluated with :func:`route_shape_penalty`, combining
-    convex-hull compactness, covariance anisotropy, radial dispersion and
-    angular zigzagging.  ``weights`` allows overriding the internal weights
-    (defaults to ``(0.4, 0.3, 0.2, 0.1)``) and ``e_cap`` bounds the eccentricity
-    ratio before normalization.
+    convex-hull compactness, covariance anisotropy y dispersión radial de los
+    clientes. ``weights`` permite sobreescribir los pesos internos (por defecto
+    ``(0.45, 0.35, 0.20)``) y ``e_cap`` acota la excentricidad antes de
+    normalizar.
     """
     if not routes:
         return 0.0

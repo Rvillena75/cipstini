@@ -12,6 +12,7 @@ import folium
 from branca.element import MacroElement
 from jinja2 import Template
 
+from metrics.aesthetic import EstheticCache, aesthetic_penalty as core_aesthetic_penalty
 def preparar_directorio_soluciones(dir_path: str):
     """
     Crea un directorio si no existe y borra todos los archivos .html que contenga.
@@ -159,88 +160,26 @@ def solution_cost(sol: Solution, data) -> float:
     cap_cost = sum(sum(data["demand_size"][i] for i in r) * data["cost_per_cap"] for r in active_routes)
     return base + var + cap_cost
 
-def count_self_crossings(route: List[int], nodes: List[Tuple[float,float]]) -> int:
-    def segs(rt):
-        if len(rt) < 2: return []
-        return list(zip([0] + rt, rt + [0]))
-    def ccw(A,B,C):
-        ax,ay = nodes[A]; bx,by = nodes[B]; cx,cy = nodes[C]
-        return (cy - ay)*(bx - ax) > (by - ay)*(cx - ax)
-    def intersect(s1, s2):
-        a,b = s1; c,d = s2
-        if len({a,b,c,d}) < 4: return False
-        return (ccw(a,c,d) != ccw(b,c,d)) and (ccw(a,b,c) != ccw(a,b,d))
-    
-    segments = segs(route)
-    cnt = 0
-    for i in range(len(segments)):
-        for j in range(i + 1, len(segments)):
-            if intersect(segments[i], segments[j]):
-                cnt += 1
-    return cnt
+DEFAULT_ESTHETIC_WEIGHTS = {
+    "w_balance_dist": 60.0,
+    "w_balance_stops": 60.0,
+    "w_dispersion": 40.0,
+    "w_complexity": 35.0,
+    "w_cruces_intra": 30.0,
+    "w_cruces_inter": 40.0,
+    "w_intrusion": 400.0,
+    "w_coherence": 50.0,
+}
 
-def _calculate_inter_route_crossings(routes: List[List[int]], nodes: List[Tuple[float,float]], intersect_func) -> int:
-    route_segments = []
-    for r_idx, route in enumerate(routes):
-        if not route: continue
-        path = [0] + route + [0]
-        segments = [(path[i], path[i+1]) for i in range(len(path)-1)]
-        route_segments.extend([(s, r_idx) for s in segments])
-    crossings = 0
-    for i in range(len(route_segments)):
-        for j in range(i + 1, len(route_segments)):
-            (seg1, r_idx1), (seg2, r_idx2) = route_segments[i], route_segments[j]
-            if r_idx1 != r_idx2 and intersect_func(seg1, seg2, nodes):
-                crossings += 1
-    return crossings // 2
 
-def _calculate_route_compactness_penalty(route: List[int], data: dict) -> float:
-    if len(route) < 2: return 0.0
-    total_dist = route_distance(route, data["distM"])
-    max_dist_from_depot = max(data["distM"][0, i] for i in route) if route else 0
-    if max_dist_from_depot == 0: return 0.0
-    compactness_ratio = (total_dist - 2 * max_dist_from_depot) / (2 * max_dist_from_depot)
-    return 1.0 / (1.0 + max(0, compactness_ratio))
-
-def _calculate_shared_path_penalty(routes: List[List[int]], data: dict) -> float:
-    shared_segments = {}
-    for route in routes:
-        if not route: continue
-        path = [0] + route + [0]
-        route_segments_in_route = set(tuple(sorted((path[i], path[i+1]))) for i in range(len(path)-1))
-        for segment in route_segments_in_route:
-            shared_segments[segment] = shared_segments.get(segment, 0) + 1
-    
-    penalty = sum(data["distM"][u, v] for (u, v), count in shared_segments.items() if count > 1)
-    return penalty
-
-def aesthetic_penalty(sol: Solution, data, **weights) -> float:
-    routes = [r for r in sol.routes if r]
-    if not routes: return 0.0
-    
-    def ccw(A,B,C, nodes):
-        ax,ay = nodes[A]; bx,by = nodes[B]; cx,cy = nodes[C]
-        return (cy - ay)*(bx - ax) > (by - ay)*(cx - ax)
-    def intersect(s1, s2, nodes):
-        a,b = s1; c,d = s2
-        if len({a,b,c,d}) < 4: return False
-        return ccw(a,c,d, nodes) != ccw(b,c,d, nodes) and ccw(a,b,c, nodes) != ccw(a,b,d, nodes)
-
-    crosses = sum(count_self_crossings(r, data["nodes"]) for r in routes)
-    overlap = _calculate_inter_route_crossings(routes, data["nodes"], intersect)
-    dists = [route_distance(r, data["distM"]) for r in routes]
-    balance = float(np.std(dists)) if dists else 0.0
-    stops = [len(r) for r in routes]
-    stops_balance = float(np.std(stops)) if stops else 0.0
-    compactness = sum(_calculate_route_compactness_penalty(r, data) for r in routes)
-    shared_path = _calculate_shared_path_penalty(routes, data)
-
-    return (weights.get('w_cross', 1000) * crosses + 
-            weights.get('w_overlap', 2000) * overlap + 
-            weights.get('w_balance', 1.0) * balance +
-            weights.get('w_stops_balance', 50) * stops_balance + 
-            weights.get('w_compact', 150) * compactness +
-            weights.get('w_shared_path', 0.1) * shared_path)
+def aesthetic_penalty(sol: Solution, data, weights: Optional[Dict[str, float]] = None) -> float:
+    base_weights = {**DEFAULT_ESTHETIC_WEIGHTS}
+    if weights:
+        for key, value in weights.items():
+            if key in base_weights:
+                base_weights[key] = float(value)
+    cache = EstheticCache(data)
+    return core_aesthetic_penalty(sol, data, base_weights, cache=cache)
 
 def fitness(sol: Solution, data, lam: float) -> float:
     return solution_cost(sol, data) + lam * aesthetic_penalty(sol, data)

@@ -219,12 +219,14 @@ def run_instance(
     """
     # Pesos estéticos anulados
     weights = {
-        "w_intrusion": 0.0,
         "w_dispersion": 0.0,
+        "w_complexity": 0.0,
         "w_cruces_intra": 0.0,
         "w_cruces_inter": 0.0,
         "w_balance_dist": 0.0,
         "w_balance_stops": 0.0,
+        "w_intrusion": 0.0,
+        "w_coherence": 0.0,
     }
 
     attempts = 0
@@ -327,5 +329,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

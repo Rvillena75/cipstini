@@ -147,12 +147,61 @@ def _route_shape_on_roads(route, data):
     return shape
 
 _ROUTE_DIST_CACHE = {}
+_ROUTE_METRICS_CACHE = {}
+_ROUTE_SCHEDULE_CACHE = {}
+_EVAL_CACHE = {}  # key: (routes_key, fast, lam), val: (cost, pen, obj)
+
+def _key_from_routes(routes: List[List[int]]) -> tuple:
+    """Genera una clave única para una lista de rutas activas."""
+    return tuple(tuple(rt) for rt in routes if rt)
+
+def _invalidate_cache_for(routes: List[List[int]]) -> None:
+    """Invalida el caché de distancias para las rutas dadas."""
+    for r in routes:
+        key = tuple(r)
+        _ROUTE_DIST_CACHE.pop(key, None)
+        _ROUTE_METRICS_CACHE.pop(key, None)
+        _ROUTE_SCHEDULE_CACHE.pop(key, None)
+
+def evaluate_cached(
+    routes_active: List[List[int]],
+    *,
+    fast: bool,
+    data: dict,
+    weights: dict,
+    lam: float,
+    esthetic_cache: Optional[EstheticCache] = None
+) -> tuple:
+    """Evalúa una solución con caché de resultados."""
+    key = _key_from_routes(routes_active)
+    cache_key = (key, bool(fast), float(lam))
+    if cache_key in _EVAL_CACHE:
+        return _EVAL_CACHE[cache_key]
+    sol_obj = Solution([rt[:] for rt in routes_active])
+    cost = solution_cost(sol_obj, data) if sol_obj.cost is None else sol_obj.cost
+    if lam > 0.0:
+        pen = aesthetic_penalty_fast(sol_obj, data) if fast else aesthetic_penalty(
+            sol_obj,
+            data,
+            weights,
+            cache=esthetic_cache,
+            enable_metrics=True,
+        )
+    else:
+        pen = 0.0
+    obj = cost + lam * pen
+    sol_obj.cost = cost
+    if lam > 0.0:
+        sol_obj.est_penalty = pen
+    _EVAL_CACHE[cache_key] = (cost, pen, obj)
+    return cost, pen, obj
 
 @dataclass
 class Solution:
     routes: List[List[int]]
     cost: Optional[float] = None
     est_penalty: Optional[float] = None
+    breakdown_cache: Optional[Dict[str, float]] = None
 
 
 def _routes_fit_fleet(routes: List[List[int]], idx: int, trial_route: List[int], data: dict) -> bool:
@@ -165,7 +214,7 @@ def _routes_fit_fleet(routes: List[List[int]], idx: int, trial_route: List[int],
     feasible, _, _ = pack_routes_to_vehicles(candidate, data)
     return feasible
 
-def preparar_directorio_soluciones(dir_path: str) -> None:
+def preparar_directorio_soluciones(dir_path: str, *, verbose: bool = True) -> None:
     """
     Crea el directorio si no existe y borra todos los archivos .html que contenga.
     Deja logs claros por consola.
@@ -180,9 +229,11 @@ def preparar_directorio_soluciones(dir_path: str) -> None:
             file_path = out_dir / filename
             try:
                 os.remove(file_path)
-                print(f" - Borrado: {filename}")
+                if verbose:
+                    print(f" - Borrado: {filename}")
             except Exception as e:
-                print(f"Error al borrar {file_path}: {e}")
+                if verbose:
+                    print(f"Error al borrar {file_path}: {e}")
 
 
 
@@ -294,7 +345,7 @@ def load_data(i1_dir: str = DEFAULT_I1_DIR, costs_path: str = DEFAULT_COSTS) -> 
     cost_per_meter   = float(df_cost.loc[0, "cost_per_meter"])
     cost_per_cap     = float(df_cost.loc[0, "cost_per_vehicle_capacity"])
 
-    return {
+    data = {
         "N": N, "K": K, "nodes": nodes,
         "distM": distM, "timeM": timeM,
         "demand_size": demand_size, "demand_srv_s": demand_srv_s,
@@ -308,6 +359,38 @@ def load_data(i1_dir: str = DEFAULT_I1_DIR, costs_path: str = DEFAULT_COSTS) -> 
         # extras útiles:
         "id_to_idx": id_to_idx, "idx_to_id": idx_to_id,
     }
+
+    # --- Precalcular auxiliares para heurísticas y métricas
+    data["tw_center_min"] = (tw_start_min + tw_end_min) * 0.5
+
+    if N > 1:
+        max_neighbors = min(15, N - 1)
+        dist_sub = distM[1:, 1:]
+        knn_neighbors: Dict[int, List[int]] = {}
+        for idx in range(N - 1):
+            order = np.argsort(dist_sub[idx])
+            neighs: List[int] = []
+            for o in order:
+                if o == idx:
+                    continue
+                neighs.append(o + 1)
+                if len(neighs) >= max_neighbors:
+                    break
+            knn_neighbors[idx + 1] = neighs
+        data["knn_neighbors"] = knn_neighbors
+
+        grid_size = 0.01
+        customer_cluster: Dict[int, Tuple[int, int]] = {}
+        cluster_members: Dict[Tuple[int, int], List[int]] = {}
+        for idx in range(1, N):
+            lat, lon = nodes[idx]
+            key = (int(lat / grid_size), int(lon / grid_size))
+            customer_cluster[idx] = key
+            cluster_members.setdefault(key, []).append(idx)
+        data["customer_cluster"] = customer_cluster
+        data["cluster_members"] = cluster_members
+
+    return data
 
 
 @dataclass
@@ -325,59 +408,137 @@ class RouteMetrics:
     feasible: bool = True
 
 
-def calculate_route_metrics(route: List[int], data: Dict) -> RouteMetrics:
-    """
-    Calcula métricas completas para una ruta:
-    - Aplica tiempos de viaje y agrega tiempos de servicio.
-    - Respeta ventanas de tiempo (espera si llega antes; infactible si llega después).
-    - Agrega retorno al depósito y valida contra la jornada (horizon_minutes).
-    - Devuelve RouteMetrics con load, tiempo total (min), distancia total (m) y factibilidad.
+@dataclass
+class RouteSchedule:
+    nodes: List[int]
+    arrivals: List[float]
+    departures: List[float]
+    feasible: bool
 
-    Convenciones:
-    - Nodo 0 es el depósito.
-    - 'route' NO incluye el depósito; es una secuencia de clientes (1..N-1).
-    - data debe contener: 'demand_size', 'demand_srv_s', 'tw_start_min', 'tw_end_min',
-      'timeM', 'distM', 'horizon_minutes'.
-    """
+def calculate_route_metrics(route: List[int], data: Dict) -> RouteMetrics:
     if not route:
         return RouteMetrics(load=0.0, time_min=0.0, dist=0.0, feasible=True)
 
-    # Carga total
+    key = tuple(route)
+    cached = _ROUTE_METRICS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    schedule = compute_route_schedule(route, data)
     load = float(sum(data["demand_size"][i] for i in route))
+    dist = _route_distance_direct(route, data)
 
-    # Acumuladores de tiempo (en minutos) y distancia (en metros)
-    time_min = 0.0
-    dist = 0.0
-    prev = 0  # partimos en depósito
+    if not schedule.feasible or schedule.departures[-1] > data["horizon_minutes"] + 1e-9:
+        metrics = RouteMetrics(load=load, time_min=schedule.departures[-1], dist=dist, feasible=False)
+        _ROUTE_METRICS_CACHE[key] = metrics
+        return metrics
 
-    for node in route:
-        # Viaje depósito/cliente o cliente/cliente
-        time_min += data["timeM"][prev, node] / 60.0
-        dist     += data["distM"][prev, node]
+    metrics = RouteMetrics(load=load, time_min=schedule.departures[-1], dist=dist, feasible=True)
+    _ROUTE_METRICS_CACHE[key] = metrics
+    return metrics
 
-        # Si llegamos antes, esperamos al inicio de la ventana
-        if time_min < data["tw_start_min"][node]:
-            time_min = data["tw_start_min"][node]
 
-        # Si llegamos después del fin de ventana, la ruta es infactible
-        if time_min > data["tw_end_min"][node] + 1e-9:
-            return RouteMetrics(load=load, time_min=time_min, dist=dist, feasible=False)
+def _route_distance_direct(route: List[int], data: Dict) -> float:
+    if not route:
+        return 0.0
+    distM = data["distM"]
+    total = distM[0, route[0]]
+    for a, b in zip(route, route[1:]):
+        total += distM[a, b]
+    total += distM[route[-1], 0]
+    return float(total)
 
-        # Servicio en el nodo
-        time_min += data["demand_srv_s"][node] / 60.0
+
+def compute_route_schedule(route: List[int], data: Dict) -> RouteSchedule:
+    key = tuple(route)
+    cached = _ROUTE_SCHEDULE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    nodes_path = [0] + route + [0]
+    arrivals: List[float] = [float(data["tw_start_min"][0])]
+    departures: List[float] = [float(data["tw_start_min"][0])]
+
+    feasible = True
+    current_time = departures[0]
+    timeM = data["timeM"]
+    tw_start = data["tw_start_min"]
+    tw_end = data["tw_end_min"]
+    service = data["demand_srv_s"]
+
+    for idx in range(1, len(nodes_path)):
+        prev = nodes_path[idx - 1]
+        node = nodes_path[idx]
+        current_time += timeM[prev, node] / 60.0
+        if current_time < tw_start[node]:
+            current_time = tw_start[node]
+        arrivals.append(current_time)
+        if idx < len(nodes_path) - 1:
+            if current_time > tw_end[node] + 1e-9:
+                feasible = False
+                arrivals.extend([current_time] * (len(nodes_path) - idx - 1))
+                departures.extend([current_time] * (len(nodes_path) - idx))
+                break
+            current_time += service[node] / 60.0
+        departures.append(current_time)
+
+    schedule = RouteSchedule(nodes_path, arrivals, departures, feasible)
+    _ROUTE_SCHEDULE_CACHE[key] = schedule
+    return schedule
+
+
+def simulate_insertion_schedule(
+    schedule: RouteSchedule,
+    route: List[int],
+    customer: int,
+    pos: int,
+    data: Dict,
+) -> Optional[RouteSchedule]:
+    nodes_old = schedule.nodes
+    arrivals_old = schedule.arrivals
+    departures_old = schedule.departures
+
+    nodes_new = nodes_old[:pos + 1] + [customer] + nodes_old[pos + 1:]
+    arrivals_new = arrivals_old[:pos + 1]
+    departures_new = departures_old[:pos + 1]
+
+    current_time = departures_new[-1]
+    timeM = data["timeM"]
+    tw_start = data["tw_start_min"]
+    tw_end = data["tw_end_min"]
+    service = data["demand_srv_s"]
+
+    prev = nodes_old[pos]
+    current_time += timeM[prev, customer] / 60.0
+    if current_time < tw_start[customer]:
+        current_time = tw_start[customer]
+    if current_time > tw_end[customer] + 1e-9:
+        return None
+    arrivals_new.append(current_time)
+    current_time += service[customer] / 60.0
+    departures_new.append(current_time)
+
+    prev = customer
+    for idx in range(pos + 1, len(nodes_old)):
+        node = nodes_old[idx]
+        current_time += timeM[prev, node] / 60.0
+        if idx < len(nodes_old) - 1:
+            if current_time < tw_start[node]:
+                current_time = tw_start[node]
+            if current_time > tw_end[node] + 1e-9:
+                return None
+            arrivals_new.append(current_time)
+            current_time += service[node] / 60.0
+            departures_new.append(current_time)
+        else:
+            arrivals_new.append(current_time)
+            departures_new.append(current_time)
         prev = node
 
-    # Retorno al depósito
-    time_min += data["timeM"][prev, 0] / 60.0
-    dist     += data["distM"][prev, 0]
+    if current_time > data["horizon_minutes"] + 1e-9:
+        return None
 
-    # Jornada
-    if time_min > data["horizon_minutes"] + 1e-9:
-        return RouteMetrics(load=load, time_min=time_min, dist=dist, feasible=False)
-
-    return RouteMetrics(load=load, time_min=time_min, dist=dist, feasible=True)
-
-
+    return RouteSchedule(nodes_new, arrivals_new, departures_new, True)
 def route_feasible(route: List[int], cap: float, data: Dict) -> bool:
     """
     Factibilidad de una ruta para un vehículo:
@@ -406,81 +567,166 @@ def pack_routes_to_vehicles(
 ) -> Tuple[bool, List[Optional[int]], List[float]]:
     """
     Asigna cada ruta a un vehículo disponible respetando capacidades (y, opcionalmente,
-    factibilidad temporal con esa capacidad). Implementa Best-Fit Decreasing:
-      1) Ordena rutas por demanda descendente.
-      2) Intenta asignarlas al vehículo con *menor* capacidad restante que aún alcance.
-      3) Devuelve:
+    factibilidad temporal con esa capacidad). Implementa un "best-fit" sin replicar el
+    algoritmo completo de empaquetamiento, lo que reduce drásticamente el costo.
+
+    Devuelve:
          - ok (bool): True si TODAS las rutas pudieron asignarse.
          - assign (List[Optional[int]]): índice de vehículo por ruta (en orden original).
-         - remaining_caps (List[float]): capacidades remanentes por vehículo (en orden original).
-    
-    Notas:
-    - No modifica el orden de `data["vehicle_caps"]` (se conserva índice real del vehículo).
-    - Si `check_time_feasibility=True`, valida cada ruta con route_feasible(route, cap, data).
-    - No mezcla rutas en un mismo vehículo más allá de su capacidad restante (modelo 1-ruta-por-vehículo
-      o multi-ruta-por-vehículo depende de cómo definas “vehículo” y “ruta” en tus costos; por defecto
-      este empaquetado permite varias rutas por vehículo SOLO si hay saldo de capacidad, aunque lo normal
-      en VRPTW es 1 ruta = 1 vehículo por jornada. Si quieres forzar 1:1, ver el flag more_strict_1_route_per_vehicle).
+         - remaining_caps (List[float]): capacidades remanentes (solo informativo).
     """
-    # --- Si quieres forzar 1 ruta = 1 vehículo por jornada, activa este flag:
-    more_strict_1_route_per_vehicle = True
 
-    V = list(map(float, data["vehicle_caps"]))  # Copia de capacidades disponibles
+    tol = 1e-9
+    vehicle_caps = list(map(float, data["vehicle_caps"]))
     n_routes = len(routes)
-    n_veh = len(V)
+    n_veh = len(vehicle_caps)
+    if n_routes > n_veh:
+        return False, [None] * n_routes, vehicle_caps
 
-    # Precalcular demandas por ruta
     route_loads = [sum(data["demand_size"][i] for i in r) for r in routes]
-
-    # Indices de rutas ordenados por demanda (desc)
     order = sorted(range(n_routes), key=lambda idx: route_loads[idx], reverse=True)
 
-    # Resultado en orden original de rutas
+    remaining = sorted([(idx, cap) for idx, cap in enumerate(vehicle_caps)], key=lambda x: x[1])
     assign: List[Optional[int]] = [None] * n_routes
-    remaining_caps = V[:]  # saldo por vehículo (se irá reduciendo si permitimos multi-ruta por vehículo)
 
-    # Para BFD necesitamos, por cada ruta, encontrar el vehículo con capacidad mínima que aún baste.
     for ridx in order:
         load = route_loads[ridx]
-
-        # Elegibles: vehículos cuyo saldo >= load
-        candidates = [(vi, remaining_caps[vi]) for vi in range(n_veh) if remaining_caps[vi] + 1e-9 >= load]
-
-        if not candidates:
-            # No hay vehículo que alcance
-            return False, assign, remaining_caps
-
-        # Best-fit: el que deje MENOS espacio libre (capacidad más ajustada)
-        candidates.sort(key=lambda x: x[1])  # menor capacidad restante primero
-        chosen_vi = None
-
-        for vi, cap_left in candidates:
-            # Si queremos 1 ruta por vehículo, ese vehículo no debe estar ya asignado a otra ruta
-            if more_strict_1_route_per_vehicle and any(a == vi for a in assign):
+        chosen_pos = None
+        for pos, (veh_idx, cap) in enumerate(remaining):
+            if cap + tol < load:
                 continue
-
-            # (Opcional) Chequear factibilidad temporal con esa "capacidad" de vehículo
-            if check_time_feasibility:
-                if not route_feasible(routes[ridx], remaining_caps[vi], data):
-                    # con este vehículo no da; probamos siguiente candidato
-                    continue
-
-            chosen_vi = vi
+            if check_time_feasibility and not route_feasible(routes[ridx], cap, data):
+                continue
+            chosen_pos = pos
             break
+        if chosen_pos is None:
+            return False, assign, vehicle_caps
+        veh_idx, cap = remaining.pop(chosen_pos)
+        assign[ridx] = veh_idx
 
-        if chosen_vi is None:
-            return False, assign, remaining_caps
-
-        # Asignar ruta → vehículo y descontar capacidad si permitimos multi-ruta por vehículo
-        assign[ridx] = chosen_vi
-        if not more_strict_1_route_per_vehicle:
-            remaining_caps[chosen_vi] -= load
-
-    return True, assign, remaining_caps
+    return True, assign, [cap for _, cap in remaining]
 
 
 
-# --- Destroy 1: aleatorio (liviano, estable) ---
+# --- Destroy 1: Shaw removal (clientes relacionados) ---
+def destroy_shaw(
+    sol: Solution,
+    p: float,
+    data: dict,
+    alpha: float = 0.5,
+    beta: float = 0.3,
+    gamma: float = 0.2,
+    delta: float = 0.2,
+) -> Tuple[Solution, List[int]]:
+    """Destruye usando Shaw removal con candidatos limitados por vecindario y clústeres."""
+
+    routes = [r[:] for r in sol.routes]
+    all_clients = [c for r in routes for c in r]
+    if not all_clients:
+        return Solution(routes), []
+
+    knn = data.get("knn_neighbors")
+    customer_cluster = data.get("customer_cluster")
+    cluster_members = data.get("cluster_members")
+    tw_center_arr = data.get("tw_center_min")
+
+    if not knn or not customer_cluster or not cluster_members or tw_center_arr is None:
+        # Fallback al comportamiento original si faltan caches
+        k = max(1, int(len(all_clients) * p))
+        seed = random.choice(all_clients)
+
+        def tw_center(i: int) -> float:
+            return 0.5 * (data["tw_start_min"][i] + data["tw_end_min"][i])
+
+        def rel(i: int, j: int) -> float:
+            dij = data["distM"][i, j]
+            tij = abs(tw_center(i) - tw_center(j))
+            sij = abs(data["demand_size"][i] - data["demand_size"][j])
+            return alpha * dij + beta * tij + gamma * sij
+
+        removed = [seed]
+        cand = set(all_clients) - {seed}
+        while len(removed) < k and cand:
+            j = min(cand, key=lambda x: min(rel(x, r) for r in removed))
+            removed.append(j)
+            cand.remove(j)
+
+        removed_set = set(removed)
+        new_routes = [[i for i in r if i not in removed_set] for r in routes]
+        return Solution(new_routes), removed
+
+    nodes = data["nodes"]
+    distM = data["distM"]
+    demand = data["demand_size"]
+
+    cust_to_route: Dict[int, int] = {}
+    route_centroids: Dict[int, Tuple[float, float]] = {}
+    for ri, route in enumerate(routes):
+        if not route:
+            continue
+        lat_sum = sum(nodes[c][0] for c in route)
+        lon_sum = sum(nodes[c][1] for c in route)
+        route_centroids[ri] = (lat_sum / len(route), lon_sum / len(route))
+        for cust in route:
+            cust_to_route[cust] = ri
+
+    neighbor_cap = data.get("shaw_neighbor_limit", 20)
+    removed: List[int] = []
+    removed_set: set = set()
+    remaining = set(all_clients)
+
+    seed = random.choice(all_clients)
+    removed.append(seed)
+    removed_set.add(seed)
+    remaining.discard(seed)
+
+    def tw_center(idx: int) -> float:
+        return float(tw_center_arr[idx])
+
+    def centroid_distance(i: int, j: int) -> float:
+        ri = cust_to_route.get(i)
+        if ri is None:
+            return 0.0
+        cx, cy = route_centroids.get(ri, nodes[0])
+        lat_j, lon_j = nodes[j]
+        return math.hypot(lat_j - cx, lon_j - cy)
+
+    def rel(i: int, j: int) -> float:
+        dij = distM[i, j]
+        tij = abs(tw_center(i) - tw_center(j))
+        sij = abs(demand[i] - demand[j])
+        cdist = centroid_distance(i, j)
+        return alpha * dij + beta * tij + gamma * sij + delta * cdist
+
+    k_remove = max(1, int(len(all_clients) * p))
+
+    while len(removed) < k_remove and remaining:
+        candidate_pool: set = set()
+        for r in removed:
+            candidate_pool.update(knn.get(r, [])[:neighbor_cap])
+            cluster_key = customer_cluster.get(r)
+            if cluster_key is not None:
+                candidate_pool.update(cluster_members.get(cluster_key, []))
+            route_idx = cust_to_route.get(r)
+            if route_idx is not None:
+                candidate_pool.update(routes[route_idx])
+
+        candidate_pool &= remaining
+        if not candidate_pool:
+            candidate_pool = set(remaining)
+
+        def score(cust: int) -> float:
+            return min(rel(cust, r) for r in removed)
+
+        chosen = min(candidate_pool, key=score)
+        removed.append(chosen)
+        removed_set.add(chosen)
+        remaining.discard(chosen)
+
+    new_routes = [[cust for cust in r if cust not in removed_set] for r in routes]
+    return Solution(new_routes), removed
+
+# --- Destroy 2: aleatorio (liviano, estable) ---
 def destroy_random(sol: Solution, p: float = 0.15, data: dict = None) -> Tuple[Solution, List[int]]:
     """Elimina ~p de los clientes al azar (al menos 1)."""
     all_clients = [i for r in sol.routes for i in r]
@@ -491,7 +737,7 @@ def destroy_random(sol: Solution, p: float = 0.15, data: dict = None) -> Tuple[S
     new_routes = [[i for i in r if i not in removed_set] for r in sol.routes]
     return Solution(new_routes), list(removed_set)
 
-# --- Destroy 2: peores por contribución marginal (inteligente) ---
+# --- Destroy 3: peores por contribución marginal (inteligente) ---
 def destroy_worst(sol: Solution, p: float, data: dict) -> Tuple[Solution, List[int]]:
     """
     Remueve ~p de los clientes con mayor “costo marginal” en su posición actual:
@@ -518,14 +764,33 @@ def destroy_worst(sol: Solution, p: float, data: dict) -> Tuple[Solution, List[i
     new_routes = [[i for i in r if i not in removed_set] for r in sol.routes]
     return Solution(new_routes), removed
 
+    def tw_center(i):
+        return 0.5*(data["tw_start_min"][i] + data["tw_end_min"][i])
+    def rel(i, j):
+        dij = data["distM"][i, j]
+        tij = abs(tw_center(i) - tw_center(j))
+        sij = abs(data["demand_size"][i] - data["demand_size"][j])
+        return alpha*dij + beta*tij + gamma*sij
 
-def destroy_zone(
-    sol: Solution,
-    p: float,
-    data: dict,
-) -> Tuple[Solution, List[int]]:
-    """Mantiene compatibilidad delegando en la eliminación aleatoria."""
-    return destroy_random(sol, p=p, data=data)
+    removed = [seed]
+    cand = set(all_clients) - {seed}
+    while len(removed) < k and cand:
+        # elige el más relacionado con cualquiera ya removido
+        j = min(cand, key=lambda x: min(rel(x, r) for r in removed))
+        removed.append(j); cand.remove(j)
+
+    removed_set = set(removed)
+    new_routes = [[i for i in r if i not in removed_set] for r in routes]
+    return Solution(new_routes), removed
+    for r in routes:
+        if acc < target:
+            removed += r; acc += len(r)
+        else:
+            keep.append(r)
+    return Solution(keep + [[] for _ in range(len(sol.routes)-len(keep))]), removed
+
+
+
 
 # --- Repair: Regret-k (regret=3 por defecto) ---
 def q_insert_regret(
@@ -541,7 +806,19 @@ def q_insert_regret(
     routes = [r[:] for r in sol.routes]
     pen_cache: Dict[Tuple[Tuple[int, ...], ...], float] = {}
     cost_cache: Dict[Tuple[Tuple[int, ...], ...], float] = {}
-    esthetic_cache = cache or EstheticCache(data)
+    esthetic_cache = None
+    if lam > 0.0:
+        esthetic_cache = cache if cache is not None else EstheticCache(data)
+    feas_cache: Dict[Tuple[Tuple[int, ...], float], bool] = {}
+    top_m_insert = int(data.get("top_m_insertion", 4))
+
+    def _route_feasible_cached(rt: List[int], cap: float) -> bool:
+        key = (tuple(rt), float(cap))
+        res = feas_cache.get(key)
+        if res is None:
+            res = route_feasible(rt, cap, data)
+            feas_cache[key] = res
+        return res
 
     def _evaluate(candidate_routes: List[List[int]]) -> Tuple[float, float, float]:
         active = [rt for rt in candidate_routes if rt]
@@ -559,12 +836,18 @@ def q_insert_regret(
             cost = solution_cost(sol_obj, data)
             cost_cache[key] = cost
 
-        if need_pen:
+        if need_pen and esthetic_cache is not None:
             if key in pen_cache:
                 pen = pen_cache[key]
             else:
                 sol_obj = sol_obj or Solution([rt[:] for rt in active])
-                pen = aesthetic_penalty(sol_obj, data, weights, cache=esthetic_cache)
+                pen = aesthetic_penalty(
+                    sol_obj,
+                    data,
+                    weights,
+                    cache=esthetic_cache,
+                    enable_metrics=True,
+                )
                 pen_cache[key] = pen
 
         return cost, pen, cost + lam * pen
@@ -574,46 +857,74 @@ def q_insert_regret(
     max_cap = max(map(float, data["vehicle_caps"])) if data["vehicle_caps"] else 0.0
 
     while removed:
+        route_schedules = {tuple(r): compute_route_schedule(r, data) for r in routes}
+        route_loads = {tuple(r): sum(data["demand_size"][i] for i in r) for r in routes}
+
         options = []
         for cust in removed:
             candidates: List[Dict[str, object]] = []
 
             for ri, r in enumerate(routes):
+                if top_m_insert <= 0:
+                    limit = len(r) + 1
+                else:
+                    limit = top_m_insert
+
+                pos_info: List[Tuple[float, int, int, int]] = []
                 for pos in range(len(r) + 1):
                     prev = r[pos - 1] if pos > 0 else 0
                     nxt = r[pos] if pos < len(r) else 0
                     lb = data["distM"][prev, cust] + data["distM"][cust, nxt] - data["distM"][prev, nxt]
+                    pos_info.append((float(lb), pos, prev, nxt))
 
-                    trial = r[:pos] + [cust] + r[pos:]
-                    if not route_feasible(trial, max_cap, data):
+                pos_info.sort(key=lambda x: x[0])
+
+                for lb, pos, prev, nxt in pos_info[:limit]:
+                    new_load = route_loads[tuple(r)] + data["demand_size"][cust]
+                    if new_load > max_cap + 1e-9:
                         continue
+                    base_sched = route_schedules[tuple(r)]
+                    new_sched = simulate_insertion_schedule(base_sched, r, cust, pos, data)
+                    if new_sched is None:
+                        continue
+                    trial = r[:pos] + [cust] + r[pos:]
                     if not _routes_fit_fleet(routes, ri, trial, data):
                         continue
 
                     candidates.append({
-                        'lb': float(lb),
+                        'lb': lb,
                         'ri': ri,
                         'pos': pos,
                         'new_route': False,
+                        'schedule': new_sched,
                     })
 
             if len(routes) < data["K"]:
                 trial = [cust]
-                if route_feasible(trial, max_cap, data) and _routes_fit_fleet(routes, len(routes), trial, data):
-                    lb_new = data["distM"][0, cust] + data["distM"][cust, 0]
-                    candidates.append({
-                        'lb': float(lb_new),
-                        'ri': len(routes),
-                        'pos': 0,
-                        'new_route': True,
-                    })
+                if data["demand_size"][cust] <= max_cap + 1e-9:
+                    sched_new = compute_route_schedule(trial, data)
+                    if sched_new.feasible and sched_new.departures[-1] <= data["horizon_minutes"] + 1e-9 and _routes_fit_fleet(routes, len(routes), trial, data):
+                        lb_new = data["distM"][0, cust] + data["distM"][cust, 0]
+                        candidates.append({
+                            'lb': float(lb_new),
+                            'ri': len(routes),
+                            'pos': 0,
+                            'new_route': True,
+                            'schedule': sched_new,
+                        })
 
             if not candidates:
                 continue
 
+            # Filtrar por límite inferior y tomar top-M candidatos
+            if any(x['lb'] > 1e6 for x in candidates):
+                continue
+            
             candidates.sort(key=lambda x: x['lb'])
-            shortlisted = candidates[:max(1, k * 4)]
-
+            M = min(10, len(candidates))  # Ajustar M según tamaño de instancia
+            shortlisted = candidates[:M]
+            
+            # Primera fase: evaluación rápida con estética fast
             evaluated = []
             for cand in shortlisted:
                 trial_routes = routes.copy()
@@ -627,21 +938,44 @@ def q_insert_regret(
                     new_route = routes[route_idx][:pos] + [cust] + routes[route_idx][pos:]
                     trial_routes[route_idx] = new_route
 
-                cand_cost, cand_pen, cand_obj = _evaluate(trial_routes)
+                # Primera evaluación rápida
+                trial_routes_active = [r for r in trial_routes if r]
+                _, _, fast_obj = evaluate_cached(
+                    routes_active=trial_routes_active,
+                    fast=True,
+                    data=data,
+                    weights=weights,
+                    lam=lam,
+                    esthetic_cache=cache
+                )
                 evaluated.append({
-                    'obj': cand_obj,
+                    'obj': fast_obj,
+                    'trial_routes': trial_routes,
                     'ri': route_idx,
                     'route': new_route,
-                    'new_route': cand['new_route'],
-                    'cost': cand_cost,
-                    'pen': cand_pen,
+                    'new_route': cand['new_route']
                 })
 
             if not evaluated:
                 continue
 
+            # Segunda fase: evaluación completa solo para top-k
             evaluated.sort(key=lambda x: x['obj'])
-            top = evaluated[:max(1, k)]
+            top = evaluated[:k]
+            for e in top:
+                # Reevaluar los k mejores con estética completa
+                _, _, full_obj = evaluate_cached(
+                    routes_active=[r for r in e['trial_routes'] if r],
+                    fast=False,
+                    data=data,
+                    weights=weights,
+                    lam=lam,
+                    esthetic_cache=cache
+                )
+                e['obj'] = full_obj
+            
+            # Reordenar por obj completo y tomar el mejor
+            top.sort(key=lambda x: x['obj'])
             best = top[0]
             regret = sum(top[i]['obj'] - best['obj'] for i in range(1, len(top)))
             options.append({'cust': cust, 'regret': regret, 'ins': best})
@@ -657,13 +991,17 @@ def q_insert_regret(
         if ins['new_route']:
             new_route = list(ins['route'])
             routes.append(new_route)
+            _invalidate_cache_for([new_route])
         else:
             idx = int(ins['ri'])
             new_route = list(ins['route'])
             if idx < len(routes):
+                old_route = routes[idx]
                 routes[idx] = new_route
+                _invalidate_cache_for([old_route, new_route])
             else:
                 routes.append(new_route)
+                _invalidate_cache_for([new_route])
         removed.remove(cust)
 
         baseline_cost = ins.get('cost', baseline_cost)
@@ -699,78 +1037,107 @@ def improve_route_with_2opt(route: List[int], data: dict) -> List[int]:
     return best
 """
 
-def improve_route_with_2opt(route: List[int], data: dict) -> List[int]:
+def improve_route_with_2opt(route: List[int], data: dict, min_gain: float = 5) -> List[int]:
     """
-    2-opt con:
-    - first-improvement,
-    - umbral de mejora (min_gain),
-    - detector de ciclos que conserva explícitamente la ruta de menor distancia.
+    Búsqueda local basada en 2-opt dentro de una ruta.
+    Usa best-improvement con umbral min_gain para ignorar micro-mejoras.
     """
     if len(route) < 4:
         return route
 
     distM = data["distM"]
     best = route[:]
-    best_cost = route_distance(best, distM)
-
-    seen = set()                 # rutas ya visitadas (tuplas)
-    prev_best = best[:]          # respaldo de la mejor ruta antes de la última mejora
-    prev_best_cost = best_cost
-
-    min_gain = 1              # exige mejoras > 1 metro (ajusta según escala)
-    improved = True
-
-    while improved:
+    max_iterations = 100  # Límite de iteraciones
+    iteration = 0
+    
+    while iteration < max_iterations:
+        iteration += 1
         improved = False
-
-        key = tuple(best)
-        if key in seen:
-            # Ciclo detectado: quedarse explícitamente con la de menor distancia real
-            if prev_best_cost < best_cost:
-                best = prev_best[:]
-                best_cost = prev_best_cost
-            # si best ya era mejor, lo dejamos tal cual
-            break
-        seen.add(key)
-
         path = [0] + best + [0]
+        best_gain = 0.0
+        best_ij = None
+        
+        # Una sola pasada buscando la mejor mejora
         for i in range(1, len(path) - 2):
+            Ai, Bi = path[i-1], path[i]
             for j in range(i + 1, len(path) - 1):
-                A, B, C, D = path[i-1], path[i], path[j], path[j+1]
-
-                # Evita swaps con arcos castigados
-                if (distM[A, B] >= 1e9 or distM[C, D] >= 1e9 or
-                    distM[A, C] >= 1e9 or distM[B, D] >= 1e9):
+                Cj, Dj = path[j], path[j+1]
+                # Ignorar arcos inválidos
+                if (distM[Ai, Bi] >= 1e9 or distM[Cj, Dj] >= 1e9 or
+                    distM[Ai, Cj] >= 1e9 or distM[Bi, Dj] >= 1e9):
                     continue
-
-                # Ganancia (cuánto baja la distancia si aplico el swap)
-                gain = (distM[A, B] + distM[C, D]) - (distM[A, C] + distM[B, D])
-                if gain > min_gain:
+                gain = (distM[Ai, Bi] + distM[Cj, Dj]) - (distM[Ai, Cj] + distM[Bi, Dj])
+                if gain > max(min_gain, best_gain):
                     candidate = best[:i] + best[i:j][::-1] + best[j:]
-                    # Evitar aceptar la misma secuencia
-                    if candidate == best:
-                        continue
-                    # Chequea factibilidad rápida
-                    if not calculate_route_metrics(candidate, data).feasible:
-                        continue
-
-                    cand_cost = route_distance(candidate, distM)
-                    if cand_cost + 1e-9 < best_cost:   # mejora real
-                        # Guarda respaldo antes de actualizar (para resolver ciclos)
-                        prev_best = best[:]
-                        prev_best_cost = best_cost
-
-                        best = candidate
-                        best_cost = cand_cost
-                        improved = True
-                        break  # first-improvement
-            if improved:
-                break
+                    if calculate_route_metrics(candidate, data).feasible:
+                        best_gain = gain
+                        best_ij = (i, j)
+        
+        # Aplicar la mejor mejora encontrada
+        if best_ij:
+            i, j = best_ij
+            best = best[:i] + best[i:j][::-1] + best[j:]
+            improved = True
+            _invalidate_cache_for([best])
 
     return best
 
 
 
+
+
+
+# --- Búsqueda local (inter-ruta): swap entre rutas con control de capacidad + TW ---
+def improve_with_swap(sol: Solution, data: dict) -> Tuple[Solution, bool]:
+    """Mejora la solución intercambiando clientes entre rutas diferentes."""
+    routes = [r[:] for r in sol.routes]
+    best = Solution([r[:] for r in routes])
+    best_val = sum(route_distance(r, data["distM"]) for r in routes if r)
+    improved = False
+    
+    for i, r1 in enumerate(routes):
+        if not r1:  # Skip empty routes
+            continue
+        for j, r2 in enumerate(routes):
+            if j <= i or not r2:  # Skip same route and empty routes
+                continue
+            for a_idx, a in enumerate(r1):
+                for b_idx, b in enumerate(r2):
+                    # Try swapping a and b between routes
+                    nr1 = r1[:a_idx] + [b] + r1[a_idx+1:]
+                    nr2 = r2[:b_idx] + [a] + r2[b_idx+1:]
+                    
+                    # Check time windows feasibility
+                    if not calculate_route_metrics(nr1, data).feasible or \
+                       not calculate_route_metrics(nr2, data).feasible:
+                        continue
+                        
+                    # Check vehicle capacity feasibility
+                    ok, _, _ = pack_routes_to_vehicles(
+                        [rr for k, rr in enumerate(routes) if k not in (i,j)] + [nr1, nr2],
+                        data
+                    )
+                    if not ok:
+                        continue
+                        
+                    # Calculate new total distance
+                    val = sum(
+                        route_distance(rr, data["distM"])
+                        for k, rr in enumerate(routes)
+                        if k not in (i,j)
+                    )
+                    val += route_distance(nr1, data["distM"]) + route_distance(nr2, data["distM"])
+                    
+                    # Update if improvement found
+                    if val + 1e-6 < best_val:
+                        routes[i], routes[j] = nr1, nr2
+                        best = Solution([r[:] for r in routes])
+                        best_val = val
+                        improved = True
+                        # Invalidar caché para las rutas modificadas
+                        _invalidate_cache_for([nr1, nr2])
+                        
+    return best, improved
 
 # --- Búsqueda local (inter-ruta): relocate con control de capacidad + TW ---
 def improve_with_relocate(sol: Solution, data: dict) -> Tuple[Solution, bool]:
@@ -817,6 +1184,8 @@ def improve_with_relocate(sol: Solution, data: dict) -> Tuple[Solution, bool]:
                             candidate_active = [r for r in routes if r]
                             ok, _, _ = pack_routes_to_vehicles(candidate_active, data)
                             if ok:
+                                # Invalida el caché para las rutas modificadas
+                                _invalidate_cache_for([new_r1, new_r2])
                                 return Solution(candidate_active), True
 
                             routes[r1_idx], routes[r2_idx] = old_r1, old_r2
@@ -838,32 +1207,31 @@ def route_distance(route: List[int], distM: np.ndarray) -> float:
     _ROUTE_DIST_CACHE[key] = d
     return d
 
-def _invalidate_route_cache(routes: List[List[int]]):
-    # Si no quieres cache grande/antiguo, invalida cuando cambias rutas
-    for r in routes:
-        _ROUTE_DIST_CACHE.pop(tuple(r), None)
-
 def solution_cost(sol, data) -> float:
-    """
-    Costo operativo de una solución:
-      - Costo fijo por cada ruta activa
-      - Costo variable por distancia recorrida
-      - (Opcional) Costo por capacidad utilizada (aproximación)
-    Requiere en `data`:
-      - fixed_route_cost, cost_per_meter, cost_per_cap
-      - distM, demand_size
-    """
     active_routes = [r for r in sol.routes if r]
-    # fijo por ruta
-    base_cost = len(active_routes) * data["fixed_route_cost"]
-    # variable por distancia
+    m = len(active_routes)
+    
+    # Si requieres estrictamente 1:1, verificar número máximo de rutas
+    if m > data["K"]:
+        return float("inf")
+        
+    # Costo fijo por ruta
+    base_cost = m * data["fixed_route_cost"]
+    
+    # Costo variable por distancia
     total_dist = sum(route_distance(r, data["distM"]) for r in active_routes)
     var_cost = total_dist * data["cost_per_meter"]
-    # costo por capacidad usada (aprox. sumatoria de tamaños atendidos)
-    cap_cost = sum(
-        sum(data["demand_size"][i] for i in r) * data["cost_per_cap"]
-        for r in active_routes
-    )
+    
+    ok, assign_idx, _ = pack_routes_to_vehicles(active_routes, data)
+    if not ok:
+        return float("inf")
+    veh_caps = list(map(float, data["vehicle_caps"]))
+    cap_cost = 0.0
+    for ridx, veh_idx in enumerate(assign_idx):
+        if veh_idx is None:
+            return float("inf")
+        cap_cost += veh_caps[veh_idx] * float(data["cost_per_cap"])
+
     return base_cost + var_cost + cap_cost
 
 
@@ -910,6 +1278,99 @@ def nearest_neighbor_seed(data: Dict) -> Solution:
     return Solution(routes=routes)
 
 
+def solomon_seed_solution(
+    data: Dict,
+    alpha: float = 0.6,
+    lambda_closeness: float = 1.0,
+) -> Solution:
+    """
+    Implementación del heurístico Solomon I1 para generar una solución inicial.
+    Retorna una Solution cuyas rutas respetan capacidad y ventanas de tiempo.
+    """
+    distM = data["distM"]
+    demand = data["demand_size"]
+    vehicle_caps = list(map(float, data["vehicle_caps"]))
+    unassigned = set(range(1, data["N"]))
+    routes: List[List[int]] = []
+
+    if not vehicle_caps:
+        return Solution(routes=[])
+
+    def route_load(route: List[int]) -> float:
+        return float(sum(demand[i] for i in route))
+
+    while unassigned and vehicle_caps:
+        cap_lim = vehicle_caps.pop(0)
+
+        feasible_seeds = [
+            u
+            for u in unassigned
+            if demand[u] <= cap_lim + 1e-9 and route_feasible([u], cap_lim, data)
+        ]
+        if not feasible_seeds:
+            continue
+
+        seed = max(feasible_seeds, key=lambda u: distM[0, u])
+        route = [seed]
+        metrics = calculate_route_metrics(route, data)
+        if not metrics.feasible:
+            unassigned.remove(seed)
+            continue
+
+        cap_used = route_load(route)
+        unassigned.remove(seed)
+
+        while True:
+            candidates = []
+            for cust in list(unassigned):
+                if cap_used + demand[cust] > cap_lim + 1e-9:
+                    continue
+
+                insertions = []
+                for pos in range(len(route) + 1):
+                    trial = route[:pos] + [cust] + route[pos:]
+                    if not route_feasible(trial, cap_lim, data):
+                        continue
+
+                    trial_metrics = calculate_route_metrics(trial, data)
+                    prev_node = route[pos - 1] if pos > 0 else 0
+                    next_node = route[pos] if pos < len(route) else 0
+
+                    delta_dist = (
+                        distM[prev_node, cust]
+                        + distM[cust, next_node]
+                        - distM[prev_node, next_node]
+                    )
+                    delta_time_min = max(0.0, trial_metrics.time_min - metrics.time_min)
+                    c1 = delta_dist + alpha * (delta_time_min * 60.0)  # penaliza retrasos
+                    insertions.append((c1, pos, trial, trial_metrics))
+
+                if not insertions:
+                    continue
+
+                best_c1, best_pos, best_trial, best_metrics = min(insertions, key=lambda x: x[0])
+                candidates.append((cust, best_pos, best_c1, best_trial, best_metrics))
+
+            if not candidates:
+                break
+
+            cust, pos, c1, best_trial, best_metrics = max(
+                candidates,
+                key=lambda x: lambda_closeness * distM[0, x[0]] - x[2],
+            )
+
+            route = best_trial
+            metrics = best_metrics
+            cap_used += demand[cust]
+            unassigned.remove(cust)
+
+        routes.append(route)
+    if unassigned:
+        print(f"[WARN] Solomon I1 dejó sin asignar {len(unassigned)} clientes.")
+
+    return Solution(routes=[r[:] for r in routes])
+
+
 def _all_clients_assigned(sol: Solution, data: Dict) -> bool:
     assigned = {i for r in sol.routes for i in r}
     return assigned == set(range(1, data["N"]))
@@ -924,14 +1385,21 @@ def alns_single_run(
     T_start: float = 1.0,
     cooling_rate: float = 0.997,
     T_min = 1e-6,
-    reaction: float = 0.9,
+    reaction: float = 0.2,
+    segment_size: int = 32,  # Tamaño del segmento para actualización de scores (reducido de 50 a 32)
     use_fast_esthetics: bool = False
 ) -> Solution:
     # --- 1. INICIALIZACIÓN ---
     random.seed(seed)
     np.random.seed(seed)
 
-    esthetic_cache = EstheticCache(data)
+    _EVAL_CACHE.clear()
+    use_visual_metrics = lam > 1e-9
+    esthetic_cache = EstheticCache(data) if use_visual_metrics else None
+    solomon_seed: Optional[Solution] = None
+    solomon_eval: Optional[Tuple[float, float, float]] = None
+    baseline_solution: Optional[Solution] = None
+    baseline_value: Optional[float] = None
 
 
 # Sólo activa si quieres analizar tiempos o generar reportes detallados
@@ -944,134 +1412,325 @@ def alns_single_run(
 
         # VAMOS A MODIFICAR ESTA FUNCIÓN INTERNA
         def eval_est_full(sol: Solution) -> float:
+            if not use_visual_metrics:
+                sol.est_penalty = 0.0
+                return 0.0
             if sol.est_penalty is None:
-                sol.est_penalty = aesthetic_penalty(sol, data, weights, cache=esthetic_cache)
+                sol.est_penalty = aesthetic_penalty(
+                    sol,
+                    data,
+                    weights,
+                    cache=esthetic_cache,
+                    enable_metrics=True,
+                )
             return sol.est_penalty
 
         def eval_est_fast(sol: Solution) -> float:
+            if not use_visual_metrics:
+                return 0.0
             return aesthetic_penalty_fast(sol, data)
 
         def evaluate(sol: Solution, fast: bool) -> float:
             cost = eval_cost(sol)
-            if fast:
-                pen = eval_est_fast(sol)
-            else:
-                # AHORA LLAMA A LA VERSIÓN MODIFICADA DE ARRIBA
-                pen = eval_est_full(sol)
+            if not use_visual_metrics:
+                return cost
+            pen = eval_est_fast(sol) if fast else eval_est_full(sol)
             return cost + lam * pen
 
+        # Construir solución Solomon I1 como referencia global
+        try:
+            candidate = solomon_seed_solution(data)
+            if _all_clients_assigned(candidate, data):
+                sol_cost, sol_pen, sol_obj = evaluate_cached(
+                    routes_active=[r for r in candidate.routes if r],
+                    fast=False,
+                    data=data,
+                    weights=weights,
+                    lam=lam,
+                    esthetic_cache=esthetic_cache,
+                )
+                candidate.cost = sol_cost
+                candidate.est_penalty = sol_pen if use_visual_metrics else 0.0
+                solomon_seed = candidate
+                solomon_eval = (sol_cost, candidate.est_penalty, sol_obj)
+                baseline_solution = Solution(
+                    routes=[r[:] for r in candidate.routes],
+                    cost=candidate.cost,
+                    est_penalty=candidate.est_penalty,
+                )
+                baseline_value = sol_obj
+            else:
+                print("[WARN] Solomon I1 generó una solución infactible (quedaron clientes sin asignar).")
+        except Exception as exc:
+            print(f"[WARN] Solomon I1 no pudo generar semilla inicial: {exc}")
+
         # Solución inicial y la mejor solución encontrada
-        curr = nearest_neighbor_seed(data)
-        if not _all_clients_assigned(curr, data):
+        nn_seed = nearest_neighbor_seed(data)
+        if not _all_clients_assigned(nn_seed, data):
             raise ValueError("La solución inicial no cubre a todos los clientes.")
-    
-        curr.cost = eval_cost(curr)
-        curr.est_penalty = eval_est_full(curr)
+
+        nn_cost, nn_pen, nn_obj = evaluate_cached(
+            routes_active=[r for r in nn_seed.routes if r],
+            fast=False,
+            data=data,
+            weights=weights,
+            lam=lam,
+            esthetic_cache=esthetic_cache
+        )
+        nn_seed.cost = nn_cost
+        nn_seed.est_penalty = nn_pen if use_visual_metrics else 0.0
+
+        curr = Solution(routes=[r[:] for r in nn_seed.routes], cost=nn_seed.cost, est_penalty=nn_seed.est_penalty)
+        f_curr = nn_obj
+
+        if solomon_eval is not None and solomon_eval[2] + 1e-9 < f_curr:
+            curr = Solution(
+                routes=[r[:] for r in solomon_seed.routes],
+                cost=solomon_eval[0],
+                est_penalty=solomon_eval[1],
+            )
+            f_curr = solomon_eval[2]
+
         best = Solution(routes=[r[:] for r in curr.routes], cost=curr.cost, est_penalty=curr.est_penalty)
-    
-        # Valores iniciales para el ALNS y SA
-        f_curr = evaluate(curr, fast=use_fast_esthetics)
         f_best = f_curr
+
+        if baseline_solution is None or baseline_value is None or f_curr + 1e-9 < baseline_value:
+            baseline_solution = Solution(routes=[r[:] for r in curr.routes], cost=curr.cost, est_penalty=curr.est_penalty)
+            baseline_value = f_curr
     
         base_scale = max(abs(f_curr), 1.0)
         T = max(T_min, T_start * base_scale)
 
         destroy_ops = {
-            'random': {'op': destroy_random, 'score': 1.0, 'uses': 1},
-            'worst':  {'op': destroy_worst,  'score': 1.0, 'uses': 1},
-            'zone':   {'op': destroy_zone,   'score': 1.0, 'uses': 1},
+            'random': {'op': destroy_random, 'scores': [1.0] * segment_size, 'uses': [1] * segment_size},
+            'worst':  {'op': lambda s,p,data: destroy_worst(s,p,data), 'scores': [1.0] * segment_size, 'uses': [1] * segment_size},
+            'shaw':   {'op': lambda s,p,data: destroy_shaw(s,p,data), 'scores': [1.0] * segment_size, 'uses': [1] * segment_size},
         }
+
         REWARD_BEST, REWARD_BETTER, REWARD_ACCEPTED = 3.0, 2.0, 1.0
+        stage_threshold = float(data.get("stage_threshold", 0.0))
 
         # --- 2. BUCLE PRINCIPAL DEL ALGORITMO ---
-        for it in tqdm(range(iters), desc=f"ALNS (λ={lam})", leave=False):
+        # Inicialización para p adaptativo y estancamiento
+        last_improve_it = 0
+        p_min, p_max = 0.05, 0.40  # rango de destrucción adaptativa
         
-            # --- a. Selección de Operador Adaptativo ---
-            op_weights = [max(1e-9, d['score']) / max(1, d['uses']) for d in destroy_ops.values()]
+        for it in tqdm(range(iters), desc=f"ALNS (λ={lam})", leave=False):
+            # Adaptar p según temperatura y estancamiento
+            stall = max(0, it - last_improve_it)
+            heat = min(1.0, T / (T_start * base_scale + 1e-9))
+            p_now = p_min + (p_max - p_min) * max(heat, min(1.0, stall/200))
+            
+            # --- a. Selección de Operador Adaptativo basado en Segmentos ---
+            # Determinar el segmento actual basado en el progreso
+            current_segment = min(segment_size - 1, int(it * segment_size / iters))
+            
+            # Calcular pesos usando scores del segmento actual
+            op_weights = [max(1e-9, d['scores'][current_segment]) / max(1, d['uses'][current_segment]) 
+                         for d in destroy_ops.values()]
+            
             suma = sum(op_weights)
             if not np.isfinite(suma) or suma <= 0.0:
                 op_weights = [1.0] * len(destroy_ops)  # fallback uniforme
 
             chosen_name = random.choices(list(destroy_ops.keys()), weights=op_weights, k=1)[0]
             chosen_op_data = destroy_ops[chosen_name]
-            chosen_op_data['uses'] += 1
+            chosen_op_data['uses'][current_segment] += 1
 
 
             # --- b. Destrucción y Reparación ---
-            op_args = {'p': destroy_p, 'data': data}
+            op_args = {'p': p_now, 'data': data}  # Usar p adaptativo
             destroyed, removed = chosen_op_data['op'](curr, **op_args)
         
             # ¡Llama a la nueva función de reparación con los argumentos extra!
             cand = q_insert_regret(destroyed, removed, data, weights, lam=lam, k=3, cache=esthetic_cache)
 
             # --- c. Búsqueda Local Intensiva (VNS) ---
-            keep_searching_vns = True
-            max_loops = 100  # límite de salvavidas
-            count = 0
-            while keep_searching_vns and count < max_loops:            
-                cand, moved = improve_with_relocate(cand, data)
-                count += 1
-                if moved:
-                    continue            
-                initial_routes_str = str(cand.routes)
+            rounds = 0
+            while rounds < 3:  # Máximo 3 rondas de mejora
+                rounds += 1
+                improved = False
+                
+                # 1. Primero 2-opt intra-ruta
+                initial_routes = str(cand.routes)
                 cand.routes = [improve_route_with_2opt(r, data) for r in cand.routes if r]
-            
-                if str(cand.routes) == initial_routes_str:
-                    keep_searching_vns = False
+                if str(cand.routes) != initial_routes:
+                    improved = True
+                
+                # 2. Luego relocate inter-ruta
+                cand, moved = improve_with_relocate(cand, data)
+                if moved:
+                    improved = True
+                
+                # 3. Después swap inter-ruta
+                cand, moved = improve_with_swap(cand, data)
+                if moved:
+                    improved = True
+                    
+                # 4. Finalmente otra ronda de 2-opt
+                initial_routes = str(cand.routes)
+                cand.routes = [improve_route_with_2opt(r, data) for r in cand.routes if r]
+                if str(cand.routes) != initial_routes:
+                    improved = True
+                    
+                # Si no hubo mejoras en esta ronda, terminamos
+                if not improved:
+                    break
             # --- d. Evaluación y Criterio de Aceptación (SA) ---
             # SOLO EVALUAMOS Y CONSIDERAMOS CANDIDATOS QUE SEAN 100% COMPLETOS
             if _all_clients_assigned(cand, data):
-                cand.cost = None
-                cand.est_penalty = None  # Resetea para forzar recálculo
-                f_cand = evaluate(cand, fast=use_fast_esthetics)
-            
+                if lam <= 0.0:
+                    cand_cost = solution_cost(cand, data)
+                    cand.cost = cand_cost
+                    cand.est_penalty = 0.0
+                    cand_pen_effective = 0.0
+                    cand_obj = cand_cost
+                else:
+                    fast_cost, fast_pen, fast_obj = evaluate_cached(
+                        routes_active=[r for r in cand.routes if r],
+                        fast=True,
+                        data=data,
+                        weights=weights,
+                        lam=lam,
+                        esthetic_cache=esthetic_cache
+                    )
+                    cand_cost = fast_cost
+                    cand_pen_effective = fast_pen
+                    cand_obj = fast_obj
+
+                    need_full = False
+                    if stage_threshold <= 0.0:
+                        need_full = (fast_obj - f_curr < 0) or random.random() < 0.1
+                    else:
+                        if fast_obj <= f_best + stage_threshold:
+                            need_full = (fast_obj - f_curr < 0) or random.random() < 0.1
+
+                    if need_full:
+                        full_cost, full_pen, full_obj = evaluate_cached(
+                            routes_active=[r for r in cand.routes if r],
+                            fast=False,
+                            data=data,
+                            weights=weights,
+                            lam=lam,
+                            esthetic_cache=esthetic_cache
+                        )
+                        cand_cost = full_cost
+                        cand_pen_effective = full_pen
+                        cand_obj = full_obj
+
+                    cand.cost = cand_cost
+                    cand.est_penalty = cand_pen_effective
+
+                delta = cand_obj - f_curr
+
                 reward = 0.0
-            
-                # Compara con la MEJOR solución global (siempre usando evaluación COMPLETA)
-                f_cand_full = evaluate(cand, fast=False)
-                if f_cand_full < f_best - 1e-9:
+
+                if cand_obj < f_best - 1e-9:
                     best = Solution(
                         routes=[r[:] for r in cand.routes],
-                        cost=eval_cost(cand),
-                        est_penalty=eval_est_full(cand),
+                        cost=cand_cost,
+                        est_penalty=cand_pen_effective,
                     )
-                    f_best = f_cand_full
-                    curr, f_curr = cand, f_cand_full
+                    f_best = cand_obj
+                    curr = Solution(routes=[r[:] for r in cand.routes], cost=cand_cost, est_penalty=cand_pen_effective)
+                    f_curr = cand_obj
                     reward = REWARD_BEST
+                    last_improve_it = it
+                    if baseline_solution is None or baseline_value is None or cand_obj + 1e-9 < baseline_value:
+                        baseline_solution = Solution(routes=[r[:] for r in best.routes], cost=best.cost, est_penalty=best.est_penalty)
+                        baseline_value = cand_obj
                 else:
-                    delta = f_cand - f_curr
                     if delta < -1e-9:
-                        curr, f_curr = cand, f_cand
+                        curr = Solution(routes=[r[:] for r in cand.routes], cost=cand_cost, est_penalty=cand_pen_effective)
+                        f_curr = cand_obj
                         reward = REWARD_BETTER
+                        last_improve_it = it
                     elif delta <= 1e-9:
-                        curr, f_curr = cand, f_cand
+                        curr = Solution(routes=[r[:] for r in cand.routes], cost=cand_cost, est_penalty=cand_pen_effective)
+                        f_curr = cand_obj
                         reward = REWARD_ACCEPTED * 0.5
                     else:
                         temp = max(1e-9, T)
                         prob = math.exp(-delta / temp)
                         if random.random() < prob:
-                            curr, f_curr = cand, f_cand
+                            curr = Solution(routes=[r[:] for r in cand.routes], cost=cand_cost, est_penalty=cand_pen_effective)
+                            f_curr = cand_obj
                             reward = REWARD_ACCEPTED
             
-                chosen_op_data['score'] = (1 - reaction) * chosen_op_data['score'] + reaction * reward
+                current_segment = min(segment_size - 1, int(it * segment_size / iters))
+                chosen_op_data['scores'][current_segment] = (1 - reaction) * chosen_op_data['scores'][current_segment] + reaction * reward
         
             # --- e. Enfriamiento (fuera del if para que siempre ocurra) ---
             T = max(T_min, T * cooling_rate)
+
+        if baseline_solution is not None and baseline_value is not None:
+            best_cost = best.cost if best.cost is not None else solution_cost(best, data)
+            if best.cost is None:
+                best.cost = best_cost
+            if use_visual_metrics:
+                if best.est_penalty is None:
+                    best.est_penalty = aesthetic_penalty(
+                        best,
+                        data,
+                        weights,
+                        cache=esthetic_cache,
+                        enable_metrics=True,
+                    )
+                best_penalty = best.est_penalty
+            else:
+                best_penalty = 0.0
+            best_obj = best_cost + lam * best_penalty
+            if baseline_value + 1e-9 < best_obj:
+                best = Solution(
+                    routes=[r[:] for r in baseline_solution.routes],
+                    cost=baseline_solution.cost,
+                    est_penalty=baseline_solution.est_penalty,
+                )
 
         return best
 
     finally:
         deactivate_logging()
 
+def improve_with_swap(sol: Solution, data: dict):
+    routes = [r[:] for r in sol.routes]
+    best = Solution([r[:] for r in routes]); best_val = sum(route_distance(r, data["distM"]) for r in routes)
+    for i, r1 in enumerate(routes):
+        for j, r2 in enumerate(routes):
+            if j <= i: continue
+            for a_idx, a in enumerate(r1):
+                for b_idx, b in enumerate(r2):
+                    nr1 = r1[:a_idx] + [b] + r1[a_idx+1:]
+                    nr2 = r2[:b_idx] + [a] + r2[b_idx+1:]
+                    # validación tiempo (y capacidad vía pack)
+                    if not calculate_route_metrics(nr1, data).feasible or not calculate_route_metrics(nr2, data).feasible:
+                        continue
+                    ok, _, _ = pack_routes_to_vehicles([rr for k, rr in enumerate(routes) if k not in (i,j)] + [nr1, nr2], data)
+                    if not ok: continue
+                    val = (route_distance(nr1, data["distM"]) + route_distance(nr2, data["distM"]))
+                    val += sum(route_distance(routes[k], data["distM"]) for k in range(len(routes)) if k not in (i,j))
+                    if val + 1e-6 < best_val:
+                        routes[i], routes[j] = nr1, nr2
+                        best = Solution([r[:] for r in routes]); best_val = val
+    return best, (best_val < sum(route_distance(r, data["distM"]) for r in sol.routes))
 
 
 # ----------  MULTI-OBJETIVO POR PONDERACIÓN ----------
-def run_pareto(data, weights, lambdas=(0.0, 0.5, 1.0, 2.0, 5.0), iters=2000, seed=42, use_fast_esthetics=False):
+def run_pareto(
+    data,
+    weights,
+    lambdas=(0.0, 0.5, 1.0, 2.0, 5.0),
+    iters=2000,
+    seed=42,
+    use_fast_esthetics=False,
+    verbose: bool = True,
+):
     sols = []
     for lam in lambdas:
         s = alns_single_run(data, weights, lam=lam, iters=iters, seed=seed, use_fast_esthetics=use_fast_esthetics)
         sols.append((lam, s.cost, s.est_penalty, s))
-        print(f"Lambda: {lam}, Costo: {s.cost:.2f}, Penalidad: {s.est_penalty:.2f}")
+        if verbose:
+            print(f"Lambda: {lam}, Costo: {s.cost:.2f}, Penalidad: {s.est_penalty:.2f}")
     # quitar dominadas (min costo, min estética)
     sols_sorted = sorted(sols, key=lambda x: (x[1], x[2]))
     pareto = []
@@ -1216,11 +1875,20 @@ def export_pareto_dual_maps(data, pareto, output_dir="soluciones"):
 
 
 
-def run_single_experiment(base_seed: int, data: dict, weights: dict, lambdas: list, iters: int) -> list:
+def run_single_experiment(
+    base_seed: int,
+    data: dict,
+    weights: dict,
+    lambdas: list,
+    iters: int,
+    *,
+    verbose: bool = True,
+) -> list:
     """
     Ejecuta una corrida completa del algoritmo para todos los lambdas con una semilla base.
     """
-    print(f"\n--- INICIANDO CORRIDA CON SEED BASE = {base_seed} ---")
+    if verbose:
+        print(f"\n--- INICIANDO CORRIDA CON SEED BASE = {base_seed} ---")
 
     # Ejecuta run_pareto, que a su vez llama a alns_single_run para cada lambda
     sols, pareto = run_pareto(
@@ -1229,14 +1897,16 @@ def run_single_experiment(base_seed: int, data: dict, weights: dict, lambdas: li
         lambdas=lambdas,
         iters=iters,
         seed=base_seed,
-        use_fast_esthetics=False
+        use_fast_esthetics=False,
+        verbose=verbose,
     )
 
-    print(f"--- CORRIDA CON SEED BASE = {base_seed} FINALIZADA ---")
+    if verbose:
+        print(f"--- CORRIDA CON SEED BASE = {base_seed} FINALIZADA ---")
     return pareto
 
 
-def validar_solucion_final(sol: Solution, data: dict, nombre_solucion: str):
+def validar_solucion_final(sol: Solution, data: dict, nombre_solucion: str, *, verbose: bool = True):
     """
     Verifica si una solución final atiende a todos los clientes y reporta si faltan.
     """
@@ -1245,11 +1915,12 @@ def validar_solucion_final(sol: Solution, data: dict, nombre_solucion: str):
 
     clientes_faltantes = clientes_requeridos - clientes_atendidos
 
-    if not clientes_faltantes:
-        print(f"Validación OK para '{nombre_solucion}': Todos los {len(clientes_requeridos)} clientes están atendidos.")
-    else:
-        print(f"¡ERROR DE VALIDACIÓN en '{nombre_solucion}'!")
-        print(f"  - Clientes atendidos: {len(clientes_atendidos)} de {len(clientes_requeridos)}")
-        print(f"  - Faltan {len(clientes_faltantes)} clientes. IDs: {sorted(list(clientes_faltantes))}")
+    if verbose:
+        if not clientes_faltantes:
+            print(f"Validación OK para '{nombre_solucion}': Todos los {len(clientes_requeridos)} clientes están atendidos.")
+        else:
+            print(f"¡ERROR DE VALIDACIÓN en '{nombre_solucion}'!")
+            print(f"  - Clientes atendidos: {len(clientes_atendidos)} de {len(clientes_requeridos)}")
+            print(f"  - Faltan {len(clientes_faltantes)} clientes. IDs: {sorted(list(clientes_faltantes))}")
 
     return not clientes_faltantes

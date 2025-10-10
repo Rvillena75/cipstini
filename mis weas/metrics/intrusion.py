@@ -1,5 +1,5 @@
 import math
-from typing import Dict, List, Tuple, Optional  # <- asegúrate de incluir Optional
+from typing import Dict, List, Tuple, Optional
 
 try:  # pragma: no cover
     from line_profiler import profile as line_profile
@@ -208,4 +208,3 @@ def compute_intrusion_km(routes: List[List[int]], data: Dict) -> float:
 
 
 __all__ = ["compute_intrusion_km", "intrusion_length_between_routes_m"]
-
